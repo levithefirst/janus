@@ -16,12 +16,11 @@ The condition is the product. The AI changes the payment result; it doesn't just
 
 ```bash
 git clone https://github.com/levithefirst/janus && cd janus
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+./setup.sh                  # venv, dependencies, .env with a fresh JANUS_SECRET, full test suite
+source .venv/bin/activate
 
 python -m janus demo        # same listing, three deliveries: match, mismatch, unclear
 python -m janus serve       # then open http://localhost:8000 (works at phone width)
-pytest -q                   # 48 tests
 ```
 
 `demo` ends with a before/after table. BEFORE and AFTER are the authorization status read back from PayPal (here, the mock):
@@ -30,7 +29,7 @@ pytest -q                   # 48 tests
 SCENARIO   VERDICT    CONFIDENCE  DECISION  BEFORE   AFTER     STATE     CAPTURE
 match      met        0.97        CAPTURE   CREATED  CAPTURED  captured  MOCKCAP-611EC5AD29
 mismatch   not_met    0.97        VOID      CREATED  VOIDED    voided    -
-unclear    uncertain  0.35        HOLD      CREATED  CREATED   held      -
+unclear    uncertain  0.00        HOLD      CREATED  CREATED   held      -
 ```
 
 With no keys, both integrations run as offline stand-ins. **Mock PayPal** simulates the buyer's approval, uses PayPal's real error names and keeps state in `data/mock_paypal.json`. **Mock AI** really looks at the pixels, but crudely: it compares the colour signature of the buyer's photo with the listing photo and rejects dark or blurry photos. It proves the loop, not the judgement. For judgement, use Claude.
@@ -96,31 +95,43 @@ Use real photos of a real item for the video. The images in `examples/photos/` a
 - **Humans on a HOLD.** The buyer can release (capture) and the seller can refund (void). Neither can take money from the other. The seller's controls need the private seller link.
 - **Authorization expiry.** Before every verification and settlement, Janus reads the authorization from PayPal. If it is `EXPIRED` (PayPal authorizations last 29 days), the threshold goes to `expired` and nothing is captured. Pages re-check at most once a minute. `python -m janus sweep` checks every open threshold. After the 3-day honor period the page warns that a capture may fail.
 - **Failed captures.** Network errors, 429 and 5xx leave the threshold in `capturing`/`voiding` with the error recorded. `python -m janus settle <id>` (or *Retry now* on the page) retries without re-running the AI. A capture PayPal rejects outright (e.g. `INSTRUMENT_DECLINED`) goes to `held` with the reason, and no money has moved. `AUTHORIZATION_EXPIRED`, `AUTHORIZATION_VOIDED` and `AUTHORIZATION_ALREADY_CAPTURED` are reconciled to the true end state.
-- **Idempotency.** Every create/authorize/capture/void sends a deterministic `PayPal-Request-Id` (`janus-capture-<authorization id>`, ...), so a retry replays PayPal's original answer instead of acting twice. Authorizing twice (the return URL hit twice) is a no-op. If Janus crashes after PayPal authorized but before saving, the next attempt adopts the existing authorization. One mutation per threshold runs at a time.
+- **Idempotency.** Every money call sends `PayPal-Request-Id: janus-<job id>-<action>[-n]`, and the exact capture is written to disk before PayPal is called, so a retry or a crash replays PayPal's original answer instead of acting twice. Authorizing twice is a no-op; an authorization PayPal made before a crash is adopted. Transitions are atomic (per-job lock plus compare-and-set).
+- **Hard rules** (`janus/rules.py`), checked right before every capture and independent of the policy: explicit customer consent bound to the current terms, confidence above the bar, no capture after a void or expiry, nothing on a terminal job, no capture by the scheduler, webhooks or the provider.
+- **Expiry scheduler** (`python -m janus tick`, or inside `serve`): warns before day 3, reauthorizes once or asks for a new authorization, voids before day 29. It never captures.
+- **Evidence integrity:** quality gate, perceptual-hash reuse detection across jobs, EXIF time and GPS checks, untrusted notes. See [docs/CONFIDENCE.md](docs/CONFIDENCE.md) for what the confidence score means.
+
+Security, attacks and their status: [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md), [docs/ATTACKS.md](docs/ATTACKS.md).
 - **Sandbox negative testing.** `JANUS_PAYPAL_NEGATIVE_TEST=capture=INSTRUMENT_DECLINED` sends PayPal's `PayPal-Mock-Response` header on captures, so you can watch the failure path against the real sandbox. The mock honours the same setting.
 
 ## CLI
 
 ```bash
 python -m janus create --listing examples/listing.json        # or --title --price --condition --photo [--description]
+python -m janus consent <id>                                   # the buyer accepts the condition (needed before pay)
 python -m janus pay <id>                                       # order + buyer link + PayPal approval URL
 python -m janus authorize <id> --wait 600                      # after the buyer approves
 python -m janus evidence <id> --photo examples/photos/received_match.jpg --verify
 python -m janus verify <id>                                    # re-run on submitted evidence
 python -m janus release <id>    |  refund <id>                 # human decisions while funds are held
 python -m janus status <id>     |  settle <id>  |  sweep       # live PayPal status, retry, expiry check
-python -m janus show <id> [--json]  |  list
+python -m janus show <id> [--json]  |  list  |  packet <id>   # packet: AI reasoning per checklist item
+python -m janus tick                                           # scheduler: recover crashes, warn, reauthorize, void
+python -m janus calibrate                                      # small labelled confidence check
+python -m janus audit                                          # verify the audit log's hash chain
+python -m janus secret                                         # print a fresh JANUS_SECRET
 ```
 
 ## HTTP API
 
-All endpoints are listed at the top of `janus/server.py`. Errors are JSON: 400 bad input, 403 not the seller, 409 step not allowed in the current state, 502 PayPal or AI failure.
+Every route checks a role (`janus/server.py`, `API_ROLES`). Creating returns a buyer link (`?t=<token>`) and a seller link (`?k=<token>`); API calls send that token in `X-Janus-Token`. A missing job and a wrong token both answer 404. Other errors are JSON: 400 bad input, 401 key required, 409 step not allowed in the current state, 429 rate limited, 502 PayPal or AI failure.
 
 ```bash
 curl -s localhost:8000/api/thresholds -d '{"title":"Red mug","price":"24","condition":"Pay only if it matches the photo","photo_b64":"<base64>"}'
-curl -s -X POST localhost:8000/api/t/<id>/payment                 # -> approve_url (buyer approves on PayPal)
-curl -s localhost:8000/api/t/<id>/evidence -d '{"photo_b64":"<base64>","note":"arrived"}'   # -> captured | voided | held
-curl -s localhost:8000/api/t/<id>
+#   -> {"id": ..., "buyer_link": ".../t/<id>?t=<BUYER>", "seller_link": ".../t/<id>?k=<SELLER>"}
+curl -s -H "X-Janus-Token: <BUYER>" -X POST localhost:8000/api/t/<id>/consent
+curl -s -H "X-Janus-Token: <BUYER>" -X POST localhost:8000/api/t/<id>/payment     # -> approve_url
+curl -s -H "X-Janus-Token: <BUYER>" localhost:8000/api/t/<id>/evidence -d '{"photo_b64":"<base64>"}'  # -> captured | voided | held
+curl -s -H "X-Janus-Token: <SELLER>" localhost:8000/api/t/<id>/packet
 ```
 
 ## State machine
@@ -129,6 +140,7 @@ curl -s localhost:8000/api/t/<id>
 created -> payment_pending -> authorized -> evidence_submitted -> capturing -> captured
                                   |                |         \-> voiding   -> voided
                                   |                \-> held -> (new photo | buyer release | seller refund)
+                                  |                \-> disputed -> (withdraw | buyer release | seller refund)
                                   \-> expired  (from any state that holds funds)
 ```
 
@@ -137,22 +149,29 @@ Every change goes through `janus/state.py`, and out-of-order calls raise `Transi
 ## Layout
 
 ```
-janus/policy.py   verdict -> capture / void / hold (the rule that moves money)
+janus/policy.py   verdict -> capture / void / hold, whole or per checklist item
+janus/rules.py    hard rules checked right before every capture
+janus/evidence.py quality gate, reuse detection, EXIF, untrusted notes
+janus/scheduler.py expiry timeline and crash recovery
+janus/webhooks.py verified, deduplicated, order-independent PayPal webhooks
+janus/security.py capability tokens, tenants, signed photo URLs, rate limits
+janus/audit.py    append-only hash-chained decision log
+janus/packet.py   decision packet with the AI's reasoning per item
+janus/constants.py every time and money limit (HONOR_DAYS, AUTH_EXPIRY_DAYS, ...)
 janus/ai.py       condition compiler + verifier (Claude vision, offline mock)
 janus/service.py  one method per step; settlement, expiry, reconciliation
 janus/paypal.py   Orders v2 sandbox client + offline mock with PayPal's error names
 janus/state.py    state machine
 janus/server.py   phone-friendly pages + JSON API (stdlib only)
 janus/cli.py      CLI + `demo`
-janus/store.py    JSON file store (data/thresholds/<id>/), audit log in data/janus.log.jsonl
+janus/store.py    JSON file store (data/thresholds/<id>/), atomic and compare-and-set
 examples/         listing.json, demo photos and the script that draws them
 ```
 
 ## Limits
 
-- Sandbox only, one use case (item vs listing). No accounts. Anyone with the buyer link can act as the buyer.
-- The buyer supplies the evidence, so a buyer could photograph a different item to trigger a void. Janus reduces this (the photo must plausibly be the delivered item, and unclear goes to HOLD), but it is not fraud-proof.
-- Janus does not reauthorize after the honor period, and does not partially capture.
+- Sandbox only. No accounts: anyone with the buyer link can act as the buyer.
+- The buyer supplies the evidence, so a buyer could photograph a different item to trigger a void. Janus reduces this (reuse and capture-time checks, unclear goes to HOLD), but it is not fraud-proof. See docs/ATTACKS.md for every known gap.
 
 ## License
 
