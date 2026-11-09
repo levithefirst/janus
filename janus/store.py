@@ -62,6 +62,7 @@ class Payment(BaseModel):
     captures: list[Capture] = Field(default_factory=list)
     original_authorized_at: Optional[str] = None   # the 29-day clock starts here, reauthorize does not reset it
     reauthorize_count: int = 0
+    previous_authorization_ids: list[str] = Field(default_factory=list)
     honor_warned: bool = False
     needs_new_authorization: bool = False
     last_error: Optional[str] = None

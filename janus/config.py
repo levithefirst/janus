@@ -32,6 +32,7 @@ class Config:
     min_confidence: float = 0.85
     # Sandbox negative testing, e.g. "capture=INSTRUMENT_DECLINED". Sent as PayPal-Mock-Response.
     paypal_negative_test: str = ""
+    paypal_webhook_id: str = "mock-webhook-id"   # developer.paypal.com > your app > Webhooks > Webhook ID
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -54,4 +55,5 @@ class Config:
             base_url=env("JANUS_BASE_URL", "http://localhost:8000").rstrip("/"),
             min_confidence=float(env("JANUS_MIN_CONFIDENCE", "0.85")),
             paypal_negative_test=env("JANUS_PAYPAL_NEGATIVE_TEST", ""),
+            paypal_webhook_id=env("PAYPAL_WEBHOOK_ID", "" if paypal_mode == "sandbox" else "mock-webhook-id"),
         )

@@ -421,6 +421,13 @@ def make_handler(j: Janus):
                                              "amount": t.amount, "currency": t.currency} for t in j.store.all()])
                 return self._send(404, message_page("Not found", "There is nothing here."), "text/html")
 
+            if parts == ["paypal", "webhook"]:
+                from .webhooks import handle
+                n = int(self.headers.get("Content-Length") or 0)
+                if n > MAX_BODY:
+                    raise JanusError("request too large")
+                status, out = handle(j, dict(self.headers.items()), self.rfile.read(n))
+                return self._send(status, out)
             b = self._body()
             if parts == ["api", "thresholds"]:
                 photo = _b64(b["photo_b64"]) if b.get("photo_b64") else None

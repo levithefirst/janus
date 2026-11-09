@@ -83,6 +83,8 @@ class Janus:
         setup(config.data_dir)
         self.store = Store(config.data_dir)
         self.audit = AuditLog(config.data_dir)
+        from .webhooks import Inbox
+        self.inbox = Inbox(config.data_dir)
         self.ai = ai or (ClaudeAI(config.model) if config.ai_mode == "claude" else MockAI())
         self.paypal = paypal or (
             PayPalSandbox(config.paypal_client_id, config.paypal_client_secret,
@@ -354,10 +356,12 @@ class Janus:
                                 "No money moved; the buyer must pay again."))
             return True
         if reconcile and status == "VOIDED":
+            self._move(t, State.VOIDING, by="paypal", reconcile=True)
             self._finish(t, State.VOIDED, Outcome(action="void", by="paypal", at=now(),
                          reason="PayPal reports the authorization was voided outside Janus."))
             return True
         if reconcile and status == "CAPTURED":
+            self._move(t, State.CAPTURING, by="paypal", reconcile=True)
             self._finish(t, State.CAPTURED, Outcome(action="capture", by="paypal", at=now(),
                          reason="PayPal reports the authorization was captured outside Janus."))
             self._audit(t, "alert", "paypal", "capture found that Janus did not make", severity="high")
