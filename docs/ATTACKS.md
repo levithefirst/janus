@@ -12,11 +12,11 @@ Open (not addressed yet), Accepted (a deliberate trade-off, explained).
 
 | Status | Count |
 |---|---|
-| Mitigated | 44 |
+| Mitigated | 45 |
 | Partial | 13 |
 | Open | 1 |
 | Accepted | 3 |
-| **Total** | **61** |
+| **Total** | **62** |
 
 ## Money movement
 
@@ -108,3 +108,4 @@ Open (not addressed yet), Accepted (a deliberate trade-off, explained).
 | J7 | A crash between the partial capture and the void captures twice or leaves the rest held | Critical | Mitigated | The void is written as the next pending settlement before it is sent; recovery replays it, and the capture is replayed with the same request id | `test_jobs.py::test_crash_after_partial_capture_recovers_the_void` |
 | J8 | The customer's partial amount is zero, negative, or the whole hold | Medium | Mitigated | The amount must be positive and below what is still held; paying all of it is an accept | `test_jobs.py::test_partial_amount_must_be_positive_and_below_the_hold` |
 | J9 | The provider accepts or pays part on the customer's behalf | High | Mitigated | Accept, partial and reject are customer-only routes; the provider's token gets 404 | `test_job_http.py::test_good_job_partial_capture_then_void` |
+| J10 | A hold is renewed and both the old and the new authorization get captured | Critical | Mitigated | One live hold per job: the old authorization is voided once the new one exists; a late capture on the old hold means the new order is never authorized, or the new hold is voided at once; rule 9 refuses a capture on a replaced authorization or above the price in total; renewed holds use their own PayPal-Request-Ids | `test_renewal.py::test_late_capture_on_old_hold_before_return_means_no_new_hold`, `test_late_capture_on_old_hold_after_new_auth_voids_the_new_hold`, `test_capture_in_flight_on_old_hold_blocks_the_renewal_then_wins`, `test_rules_block_a_capture_written_for_the_replaced_authorization`, `test_rules_block_capturing_more_than_the_price_across_authorizations`, `test_scheduler_void_lapses_then_new_hold_has_its_own_request_ids` |

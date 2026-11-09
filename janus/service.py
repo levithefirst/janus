@@ -31,7 +31,7 @@ from .policy import Decision, decide, decide_items
 from .state import DECIDABLE, HOLDS_FUNDS, TERMINAL, State, TransitionError, check
 from .rules import RuleViolation
 from .security import Security, load_secret, parse_keys
-from .store import Amendment, Capture, Consent, Outcome, Pending, Store, Threshold, VerdictRecord
+from .store import Amendment, Capture, Consent, Outcome, Pending, Renewal, Store, Threshold, VerdictRecord
 
 ImageInput = Union[str, Path, bytes]
 MAX_IMAGE_BYTES = 12 * 1024 * 1024
@@ -356,10 +356,16 @@ class Janus:
                 self.store.save(t)
         return t
 
-    def authorize(self, tid: str) -> Threshold:
+    def authorize(self, tid: str, order_id: Optional[str] = None) -> Threshold:
+        """Authorize the order the customer approved on PayPal. `order_id` is the order PayPal sent the customer
+        back with; when it is the job's pending renewal order, the new hold replaces the old one."""
         with self._locked(tid) as t:
-            if t.state in HOLDS_FUNDS or t.state in TERMINAL:  # return URL hit twice, etc.
-                return t
+            r = t.payment.renewal
+            if r is not None and r.status == "pending" and (
+                    order_id == r.order_id or (order_id is None and t.state == State.HOLD_LAPSED)):
+                return self._finish_renewal(t)
+            if t.state in HOLDS_FUNDS or t.state in TERMINAL or t.state == State.HOLD_LAPSED:
+                return t  # return URL hit twice; or an old order's link after the hold lapsed: never re-adopt it
             check(t.state, State.AUTHORIZED)
             order = self.paypal.get_order(t.id, t.payment.order_id)
             existing = auth_from_order(order)
@@ -404,6 +410,8 @@ class Janus:
                     raise JanusError("send a photo")
                 if t.state in (State.CAPTURING, State.VOIDING):
                     raise TransitionError("a settlement is in progress")
+                if t.state == State.HOLD_LAPSED:
+                    raise TransitionError("the hold lapsed: the customer must approve a new hold before new photos")
                 attach_only = in_dispute or phase == "before"  # before photos never trigger a packet
             elif phase is not None:
                 raise JanusError("before/after photos are for jobs")
@@ -626,6 +634,12 @@ class Janus:
     def reject(self, tid: str, reason: str = "", channel: str = "web") -> Threshold:
         """The customer rejects the work: void the hold. Never needs an override."""
         with self._locked(tid) as t:
+            if t.kind == "job" and t.state == State.HOLD_LAPSED:  # nothing is held: close the job, no PayPal call
+                self._audit(t, "customer_rejected", "buyer", reason[:500] or "customer rejected the work",
+                            channel=channel, hold="lapsed")
+                return self._finish(t, State.VOIDED, Outcome(
+                    action="void", by="buyer", at=now(),
+                    reason=(reason[:500] or "Customer rejected the work") + ". No hold was open; nothing was charged."))
             self._require_decidable_job(t)
             check(t.state, State.VOIDING)
             self._audit(t, "customer_rejected", "buyer", reason[:500] or "customer rejected the work", channel=channel)
@@ -741,6 +755,11 @@ class Janus:
             if (paypal_exp := _parse_ts(p.expiration_time)) is not None:
                 expiry = min(expiry, paypal_exp)
             if now_ >= expiry - VOID_BEFORE_EXPIRY:
+                if t.kind == "job":  # the job stays open: the customer can approve a new hold for it
+                    self._start(t, "void", "scheduler", "The hold was about to expire before the customer decided. "
+                                "Voided so the customer's funds are released; the customer can approve a new hold.",
+                                lapse=True)
+                    return ["voided_before_expiry", "hold_lapsed"]
                 self._start(t, "void", "scheduler", "The authorization is about to expire and the condition was "
                                                     "not settled. Voided so the customer's funds are released.")
                 return ["voided_before_expiry"]
@@ -801,6 +820,10 @@ class Janus:
             raise
         exp = _parse_ts(t.payment.expiration_time)
         if status == "EXPIRED" or (status in ("CREATED", "PARTIALLY_CAPTURED") and exp and exp <= utcnow()):
+            if self._may_lapse(t):
+                self._lapse(t, "The PayPal hold expired before the customer decided. Nothing was charged; "
+                               "the customer can approve a new hold for the same job.", "EXPIRED", by="paypal")
+                return True
             self._finish(t, State.EXPIRED, Outcome(action="expired", by="paypal", at=now(),
                          reason="The PayPal authorization expired before the condition was settled. "
                                 "No money moved; the buyer must pay again."))
@@ -820,7 +843,8 @@ class Janus:
         return False
 
     def _finish(self, t: Threshold, target: State, outcome: Outcome) -> Threshold:
-        if target == State.VOIDED and t.payment.captures and t.kind == "job":
+        if target in (State.VOIDED, State.EXPIRED) and t.payment.captures and t.kind == "job":
+            target = State.PARTIALLY_CAPTURED
             captured = sum((Decimal(c.amount) for c in t.payment.captures), Decimal("0"))
             outcome = Outcome(action="partial", by=outcome.by, at=outcome.at,
                               reason=f"Captured {captured} of {t.amount} {t.currency}; the rest of the hold was voided.")
@@ -833,23 +857,172 @@ class Janus:
         self._audit(t, target.value, outcome.by, outcome.reason, capture_ids=[c.capture_id for c in t.payment.captures])
         return t
 
+    # --- job mode: the hold lapsed, the customer approves a new one for the same job ---
+
+    @staticmethod
+    def _may_lapse(t: Threshold) -> bool:
+        return t.kind == "job" and not t.payment.captures
+
+    def _lapse(self, t: Threshold, reason: str, old_status: str, by: str) -> Threshold:
+        """Nothing is held any more, but the customer has not decided. The checklist, photos and packet stay;
+        no money can move until the customer approves a new hold (start_renewal) or closes the job (reject)."""
+        p = t.payment
+        if t.state not in (State.CAPTURING, State.VOIDING):
+            t.resume_state = t.state
+        t.pending, t.outcome = None, None
+        p.authorization_status, p.last_error = old_status, None
+        self._move(t, State.HOLD_LAPSED, reason=reason, authorization_id=p.authorization_id)
+        self._audit(t, "hold_lapsed", by, reason, order_id=p.order_id, authorization_id=p.authorization_id,
+                    authorization_status=old_status, resume_state=t.resume_state.value if t.resume_state else None)
+        return t
+
+    def start_renewal(self, tid: str, terms_hash: Optional[str] = None, channel: str = "web") -> Threshold:
+        """The customer asks to approve a new hold for the same job: same checklist and evidence, new PayPal order.
+        Allowed when the old hold lapsed, or could not be reauthorized after PayPal's honor period."""
+        with self._locked(tid) as t:
+            if t.kind != "job":
+                raise JanusError("a new hold is for jobs")
+            rules.check_not_terminal(t)
+            p = t.payment
+            if t.state in (State.CAPTURING, State.VOIDING):
+                raise TransitionError("a settlement is in progress")
+            if t.state != State.HOLD_LAPSED and not p.needs_new_authorization:
+                raise TransitionError("the current hold is still valid; no new hold is needed")
+            if p.captures:
+                raise JanusError("part of this job was already captured; it cannot take a new hold")
+            if terms_hash is not None and terms_hash != rules.terms_hash(t):
+                self._audit(t, "renewal_refused", "buyer", "the terms changed after the customer was shown them",
+                            channel=channel)
+                raise StaleTermsError("the terms changed after you opened this page; reload it and read them again")
+            r = p.renewal
+            if r is not None and r.status == "pending":  # idempotent: one open renewal order at a time
+                if not r.approve_url:
+                    r.approve_url = approve_link(self.paypal.get_order(t.id, r.order_id))
+                    self.store.save(t)
+                return t
+            seq = r.seq + 1 if r else 1
+            base = self.config.base_url
+            order = self.paypal.create_order(t.id, t.amount, t.currency, t.listing.title,
+                                             return_url=f"{base}/paypal/return", cancel_url=f"{base}/",
+                                             request_id=make_request_id(t.id, "create", f"renew{seq}"))
+            why = "the hold lapsed" if t.state == State.HOLD_LAPSED else "the hold could not be reauthorized"
+            p.renewal = Renewal(seq=seq, order_id=order["order_id"], approve_url=order.get("approve_url"),
+                                reason=why, requested_at=now(), replaced_authorization_id=p.authorization_id)
+            if not p.renewal.approve_url:
+                p.renewal.approve_url = approve_link(self.paypal.get_order(t.id, order["order_id"]))
+            t.consents.append(Consent(kind="hold", by="buyer", at=now(), terms_hash=rules.terms_hash(t),
+                                      amount=t.amount, channel=channel))
+            self._record(t, "paypal", "order_created", order_id=order["order_id"], renewal=seq)
+            self.store.save(t)
+            self._audit(t, "renewal_requested", "buyer", f"customer asked to approve a new hold: {why}", seq=seq,
+                        order_id=order["order_id"], previous_order_id=p.order_id,
+                        replaced_authorization_id=p.authorization_id, terms_hash=rules.terms_hash(t), channel=channel)
+            return t
+
+    def _finish_renewal(self, t: Threshold) -> Threshold:
+        """Authorize the renewal order and retire the old authorization. Caller holds the lock.
+
+        Never two live holds that could both be captured: if the old authorization was captured in the meantime
+        (a late capture), the new one is never authorized, or is voided at once; and the hard rules only let a
+        capture run on the current authorization, for no more than the job's price across all authorizations."""
+        p, r = t.payment, t.payment.renewal
+        if t.state in TERMINAL:  # settled on the old hold while the customer was on PayPal
+            self._audit(t, "renewal_refused", "janus", f"the job is already {t.state.value}; the new order "
+                        "is not authorized, so nothing is held", order_id=r.order_id)
+            return t
+        if t.state in (State.CAPTURING, State.VOIDING):
+            raise TransitionError("a settlement on the old hold is still running; try again in a moment")
+        old_id = p.authorization_id
+        if t.state != State.HOLD_LAPSED and old_id:
+            self._expired_now(t, reconcile=True)  # a late capture or void on the old hold is found here
+            if t.state in TERMINAL:
+                self._audit(t, "renewal_refused", "janus", "PayPal reports the old hold was settled; the new order "
+                            "is not authorized", order_id=r.order_id, old_status=p.authorization_status)
+                return t
+        lapsed = t.state == State.HOLD_LAPSED
+        order = self.paypal.get_order(t.id, r.order_id)
+        existing = auth_from_order(order)
+        if existing:
+            auth = {"authorization_id": existing["id"], "status": existing.get("status"),
+                    "expiration_time": existing.get("expiration_time")}
+        elif order.get("status") != "APPROVED":
+            raise JanusError(f"the customer has not approved the new PayPal hold yet (order status {order.get('status')})")
+        else:
+            auth = self.paypal.authorize_order(t.id, r.order_id, make_request_id(t.id, "authorize", f"renew{r.seq}"))
+        new_id = auth["authorization_id"]
+        old_status = p.authorization_status
+        if not lapsed and old_id:  # the old hold is still open: release it now that the new one exists
+            try:
+                self.paypal.void_authorization(t.id, old_id, make_request_id(t.id, "void", f"renew{r.seq}-old"))
+                old_status = "VOIDED"
+            except PayPalError as e:
+                if e.issue in ("AUTHORIZATION_VOIDED", "AUTHORIZATION_ALREADY_VOIDED", "AUTHORIZATION_EXPIRED"):
+                    old_status = "EXPIRED" if e.issue == "AUTHORIZATION_EXPIRED" else "VOIDED"
+                else:
+                    # A late capture on the old hold won the race, or PayPal would not release it. Either way, do
+                    # not keep a second hold: release the new one at once.
+                    self.paypal.void_authorization(t.id, new_id, make_request_id(t.id, "void", f"renew{r.seq}-new"))
+                    r.status, r.new_authorization_id = "failed", new_id
+                    self._audit(t, "renewal_failed", "paypal", f"old hold not released ({e.issue or e}); "
+                                "the new hold was voided at once", severity="high", old_authorization_id=old_id,
+                                new_authorization_id=new_id)
+                    if e.issue in ("AUTHORIZATION_ALREADY_CAPTURED", "PREVIOUSLY_CAPTURED"):
+                        self._move(t, State.CAPTURING, by="paypal", reconcile=True)
+                        self._finish(t, State.CAPTURED, Outcome(action="capture", by="paypal", at=now(),
+                                     reason="PayPal reports the old hold was captured; the new hold was released."))
+                        self._audit(t, "alert", "paypal", "capture on the old hold found during renewal",
+                                    severity="high")
+                        return t
+                    self.store.save(t)
+                    raise JanusError("PayPal would not release the old hold, so the new one was released again. "
+                                     "Try again in a moment.")
+        if p.order_id:
+            p.previous_order_ids.append(p.order_id)
+        if old_id:
+            p.previous_authorization_ids.append(old_id)
+        p.order_id, p.approve_url = r.order_id, r.approve_url
+        p.authorization_id, p.authorization_status = new_id, auth["status"]
+        p.authorized_at = p.original_authorized_at = now()  # a new authorization: a new 29-day clock
+        p.authorized_amount = t.amount
+        p.expiration_time = auth.get("expiration_time") or iso(utcnow() + AUTH_VALIDITY)
+        p.reauthorize_count, p.honor_warned, p.needs_new_authorization, p.voided, p.last_error = 0, False, False, False, None
+        r.status, r.new_authorization_id = "done", new_id
+        self._record(t, "paypal", "authorized", authorization_id=new_id, status=auth["status"], renewal=r.seq,
+                     expiration_time=p.expiration_time)
+        if lapsed:
+            target, t.resume_state = t.resume_state or State.AUTHORIZED, None
+            self._move(t, target, reason="new hold authorized")
+        else:
+            self.store.save(t)
+        self._audit(t, "renewed", "buyer", "customer approved a new hold for the same job", seq=r.seq,
+                    old_order_id=p.previous_order_ids[-1] if p.previous_order_ids else None, new_order_id=r.order_id,
+                    old_authorization_id=old_id, old_authorization_status=old_status, new_authorization_id=new_id,
+                    expiration_time=p.expiration_time)
+        return t
+
     def _captured_total(self, t: Threshold) -> Decimal:
         return sum((Decimal(c.amount) for c in t.payment.captures), Decimal("0"))
 
     def _start(self, t: Threshold, action: str, by: str, reason: str, amount: Optional[str] = None,
                final: bool = True, items: tuple[str, ...] = (), verdict_index: Optional[int] = None,
-               then_void: bool = False) -> Threshold:
+               then_void: bool = False, lapse: bool = False) -> Threshold:
         """Write the exact settlement to disk (state + request id + amount), then execute it."""
         mid = State.CAPTURING if action == "capture" else State.VOIDING
+        # After a renewal the same job has a new authorization: its request ids must not collide with the old
+        # one's, or PayPal would replay the old authorization's void or capture instead of acting on the new one.
+        gen = f"r{t.payment.renewal.seq}-" if t.payment.renewal and t.payment.renewal.status == "done" else ""
         if action == "capture":
             amount = amount or str(Decimal(t.amount) - self._captured_total(t))
             if Decimal(amount) <= 0:  # last line of defence: PayPal is never asked to capture zero or less
                 raise JanusError(f"nothing to capture (amount {amount})")
-            rid = make_request_id(t.id, "capture", len(t.payment.captures) + 1)
+            rid = make_request_id(t.id, "capture", f"{gen}{len(t.payment.captures) + 1}")
         else:
-            rid = make_request_id(t.id, "void")
+            rid = make_request_id(t.id, "void", gen.rstrip("-") or None)
+        if t.state not in (State.CAPTURING, State.VOIDING):
+            t.resume_state = t.state  # where a job resumes if this settlement finds the hold gone
         t.pending = Pending(action=action, by=by, reason=reason, request_id=rid, amount=amount, final=final,
-                            items=list(items), verdict_index=verdict_index, then_void=then_void, at=now())
+                            items=list(items), verdict_index=verdict_index, then_void=then_void,
+                            authorization_id=t.payment.authorization_id, lapse=lapse, at=now())
         t.outcome = Outcome(action=action, by=by, reason=reason, at=now())
         self._move(t, mid, by=by, request_id=rid)
         self._audit(t, f"{action}_requested", by, reason, request_id=rid, amount=amount, final=final,
@@ -870,6 +1043,11 @@ class Janus:
         def done(target: State, why: str = "") -> Threshold:
             if why:
                 self._record(t, "paypal", "reconciled", status=p.authorization_status, detail=why)
+            # Job mode: the hold is gone but the customer never decided (a capture found it expired or voided, or
+            # the scheduler released it before expiry). Keep the job open for a new hold instead of closing it.
+            if self._may_lapse(t) and (pend.lapse or action == "capture") and target in (State.VOIDED, State.EXPIRED):
+                return self._lapse(t, why or pend.reason, "VOIDED" if target == State.VOIDED else "EXPIRED",
+                                   by=pend.by if pend.lapse else "paypal")
             act = {State.CAPTURED: "capture", State.VOIDED: "void", State.EXPIRED: "expired"}[target]
             return self._finish(t, target, Outcome(action=act, by=pend.by if act == action else "paypal",
                                                    reason=why or pend.reason, at=now()))
@@ -900,7 +1078,7 @@ class Janus:
                                                         final_capture=pend.final)
                 if not any(c.capture_id == cap["capture_id"] for c in p.captures):
                     p.captures.append(Capture(capture_id=cap["capture_id"], amount=cap.get("amount") or pend.amount,
-                                              request_id=pend.request_id, final=pend.final, items=pend.items,
+                                              authorization_id=p.authorization_id, request_id=pend.request_id, final=pend.final, items=pend.items,
                                               at=now()))
                 for rid in pend.items:
                     t.item_status[rid] = "captured"

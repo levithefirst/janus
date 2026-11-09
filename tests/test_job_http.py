@@ -71,7 +71,7 @@ def test_good_job_partial_capture_then_void(env):
     assert "Your decision" not in call("GET", f"{m}/t/{tid}?k={pt}")[1]      # the provider cannot decide
     assert call("POST", f"{m}/api/t/{tid}/accept", {}, token=pt)[0] == 404   # not even through the API
     status, t, _ = call("POST", f"{m}/api/t/{tid}/partial", {"amount": "25.00"}, token=ct)
-    assert status == 200 and t["state"] == "voided" and t["outcome"]["action"] == "partial"
+    assert status == 200 and t["state"] == "partially_captured" and t["outcome"]["action"] == "partial"
     assert [c["amount"] for c in t["payment"]["captures"]] == ["25.00"]
     html = call("GET", f"{m}/t/{tid}?t={ct}")[1]
     assert "Partly paid" in html
@@ -247,3 +247,30 @@ def test_first_tap_survives_the_live_refresh_in_a_real_browser(tmp_path):
         assert "STATE=authorized" in out.stdout, out.stdout + out.stderr
     finally:
         httpd.shutdown()
+
+
+def test_lapsed_hold_customer_approves_a_new_hold_over_http(env):
+    j, call, m = env
+    tid, ct, pt, _ = create(call, m)
+    approve_hold(call, m, tid, ct)
+    photos(call, m, tid, pt)
+    old = j.get(tid).payment.authorization_id
+    j.paypal.expire(old)
+    status, t, _ = call("POST", f"{m}/api/t/{tid}/refresh", {}, token=ct)
+    assert status == 200 and t["state"] == "hold_lapsed"
+    assert "Approve a new hold" not in call("GET", f"{m}/t/{tid}?k={pt}")[1]   # only the customer approves
+    html = call("GET", f"{m}/t/{tid}?t={ct}")[1]
+    assert "Approve a new hold" in html and "Your decision" not in html
+    assert call("POST", f"{m}/api/t/{tid}/renew", {}, token=pt)[0] == 404
+    terms = re.search(r'name="terms_hash"\s+value="([0-9a-f]{64})"', html).group(1)
+    status, _, h = call("POST", f"{m}/t/{tid}/renew?t={ct}", raw=f"terms_hash={terms}".encode())
+    assert status == 303 and f"Path={m}/paypal/return" in h["Set-Cookie"]
+    ret = urlparse(h["Location"])
+    assert parse_qs(ret.query)["token"][0] == j.get(tid).payment.renewal.order_id
+    status, _, h = call("GET", f"{ret.path}?{ret.query}", cookie=h["Set-Cookie"].split(";")[0])
+    assert status == 303 and h["Location"] == f"{m}/t/{tid}?t={ct}"
+    t = j.get(tid)
+    assert t.state.value == "packet_ready" and t.payment.previous_authorization_ids == [old]
+    assert "Your decision" in call("GET", f"{m}/t/{tid}?t={ct}")[1]
+    status, t, _ = call("POST", f"{m}/api/t/{tid}/accept", {}, token=ct)
+    assert status == 200 and t["state"] == "captured" and len(t["payment"]["captures"]) == 1

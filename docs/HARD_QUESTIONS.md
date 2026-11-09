@@ -40,9 +40,13 @@ measured. It needs provider interviews.
 PayPal holds the funds for 29 days and honors capture for 3 days. After day 3 you can reauthorize, which
 gives a new 3-day honor period but never extends past the original 29 days. In the US a reauthorization can
 be up to 115% of the original, with an increase of at most $75. Janus warns before day 3, reauthorizes once,
-then asks the customer for a new authorization, and voids before day 29 so money is never stuck. Gap: the
-"authorize again" step raises an alert but there is no re-payment flow yet. Jobs longer than 29 days need a
-new authorization; Janus does not hide that.
+then asks the customer for a new authorization, and voids before day 29 so money is never stuck. In a job,
+a hold that lapses (expired, or voided before expiry) does not close the job: it moves to `hold_lapsed` and the
+customer can approve a new hold for the same job (same checklist and photos, a new PayPal order). The old
+order and authorization stay linked in the audit chain. If the old hold is still open when the new one is
+authorized, Janus voids the old one; if a late capture on the old hold wins the race, the new hold is never
+authorized, or is voided at once. Rule 9 lets a capture run only on the current authorization and never for
+more than the price across all of them. Jobs longer than 29 days still need the customer to approve again.
 Source: [PayPal authorize and capture](https://developer.paypal.com/docs/checkout/standard/customize/authorization/),
 [Payments v2 reauthorize](https://developer.paypal.com/docs/api/payments/v2/#authorizations_reauthorize).
 

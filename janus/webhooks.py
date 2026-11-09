@@ -51,8 +51,8 @@ def find_threshold(j: "Janus", event: dict) -> Optional[str]:
     ids = _related(event.get("resource") or {})
     for t in j.store.all():
         p = t.payment
-        mine = {t.id, p.order_id, p.authorization_id, *p.previous_authorization_ids,
-                *(c.capture_id for c in p.captures)}
+        mine = {t.id, p.order_id, p.authorization_id, *p.previous_authorization_ids, *p.previous_order_ids,
+                p.renewal.order_id if p.renewal else None, *(c.capture_id for c in p.captures)}
         if ids & {x for x in mine if x}:
             return t.id
     return None

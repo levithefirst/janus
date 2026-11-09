@@ -15,6 +15,6 @@ def test_demo_runs_offline(tmp_path, monkeypatch, capsys):
     assert demo_jobs.main(["--wait", "0"]) == 0
     out = capsys.readouterr().out
     run1, run2 = out.split("Run 2:")
-    assert "outcome: voided (partial); PayPal authorization now VOIDED" in run1 and "80.00 partial" in run1
+    assert "outcome: partially_captured (partial); PayPal authorization now VOIDED" in run1 and "80.00 partial" in run1
     assert "refused" in run2 and "reused_photo" in run2 and "outcome: voided (void)" in run2
     assert out.count("chain intact") == 2

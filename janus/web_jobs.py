@@ -209,6 +209,18 @@ def _photos(j: "Janus", t: "Threshold") -> str:
     return f'<div class="photos">{"".join(figs)}</div>' if figs else '<p class="muted small">No photos yet.</p>'
 
 
+def _renew_card(j: "Janus", t: "Threshold", me: str, money: str, why: str, closable: bool = False) -> str:
+    """The customer's "Approve a new hold" action: same job, checklist and photos; a new PayPal order."""
+    close = ""
+    if closable:
+        close = """<label for="why">Or close the job</label><input id="why" maxlength="500" placeholder="Why? (optional)">
+<button class="btn ghost" onclick="decide('reject')">Reject · close the job</button><div id="err-decide" class="err"></div>"""
+    return f"""<div class="card"><h2>Approve a new hold</h2><p>{e(why)} To keep this job going, approve a new PayPal hold
+for {e(money)}. The checklist and photos stay the same. You still decide at the end.</p>
+<form method="post" action="{j.config.mount}/t/{t.id}/renew?t={quote(me)}"><input type="hidden" name="terms_hash"
+value="{e(rules.terms_hash(t))}"><button class="btn" type="submit">Approve a new hold</button></form>{close}</div>"""
+
+
 def job_page(j: "Janus", t: "Threshold", role: str) -> str:
     money = f"{t.amount} {t.currency}"
     me = j.token(t, "seller" if role == "seller" else "buyer")
@@ -220,12 +232,20 @@ def job_page(j: "Janus", t: "Threshold", role: str) -> str:
     # outcome / next step
     if t.state == State.CAPTURED:
         parts.append(f'<div class="banner ok">Paid · PayPal captured {e(money)}<p>{e(t.outcome.reason if t.outcome else "")}</p></div>')
-    elif t.state == State.VOIDED and t.outcome and t.outcome.action == "partial":
+    elif t.state == State.PARTIALLY_CAPTURED:
         parts.append(f'<div class="banner ok">Partly paid<p>{e(t.outcome.reason)}</p></div>')
     elif t.state == State.VOIDED:
         parts.append(f'<div class="banner bad">Hold released · nothing was charged<p>{e(t.outcome.reason if t.outcome else "")}</p></div>')
     elif t.state == State.EXPIRED:
         parts.append('<div class="banner warn">The PayPal hold expired · nothing was charged</div>')
+    elif t.state == State.HOLD_LAPSED:
+        if role == "seller":
+            parts.append('<div class="banner warn">The PayPal hold lapsed · nothing is held<p>Your customer has not '
+                         'decided yet. They have been asked to approve a new hold for this job. The checklist and '
+                         'photos stay as they are.</p></div>')
+        else:
+            parts.append(_renew_card(j, t, me, money, "The PayPal hold lapsed before you decided, so nothing is held "
+                                     "now and nothing was charged.", closable=True))
     elif t.state in (State.CAPTURING, State.VOIDING):
         parts.append(f'<div class="banner warn">Talking to PayPal…<p>{e(p.last_error or "")}</p></div>')
     elif t.state in (State.CREATED, State.PAYMENT_PENDING):
@@ -247,6 +267,13 @@ below.</p><button class="btn" type="submit">Approve PayPal hold</button></form><
             nxt = ("Read the packet and look at the photos, then decide below." if v else
                    "When the provider finishes, you will see the acceptance packet here.")
         parts.append(f'<div class="banner info">PayPal is holding {e(money)}<p>{e(nxt)}</p></div>')
+        if p.needs_new_authorization:
+            if role == "seller":
+                parts.append('<div class="banner warn">PayPal could not extend the hold<p>Your customer has been asked '
+                             'to approve a new hold. Until then the current hold stays open.</p></div>')
+            else:
+                parts.append(_renew_card(j, t, me, money, "PayPal could not extend the current hold. It stays open "
+                                         "for now, but it will lapse before long."))
 
     # the packet
     if v:
@@ -265,7 +292,8 @@ Overall confidence {conf}. Janus does not move money; {"your customer decides" i
     parts.append(f'<div class="card"><h2>Photos</h2>{_photos(j, t)}</div>')
 
     # provider actions
-    if role == "seller" and t.state not in (State.CAPTURED, State.VOIDED, State.EXPIRED, State.CAPTURING, State.VOIDING):
+    if role == "seller" and t.state not in (State.CAPTURED, State.VOIDED, State.EXPIRED, State.CAPTURING, State.VOIDING,
+                                            State.PARTIALLY_CAPTURED, State.HOLD_LAPSED):
         can_build = any(x.phase == "after" for x in t.evidence) and t.state == State.EVIDENCE_SUBMITTED
         parts.append(f"""<div class="card"><h2>Your photos</h2><p class="small muted">{e(t.compiled.evidence_instructions)}</p>
 <label for="f-before">Before</label><input id="f-before" type="file" accept="image/*" capture="environment">
@@ -295,6 +323,8 @@ placeholder="Why? (recorded in the audit trail)"></div>"""
     if p.order_id:
         rows = [("Mode", j.paypal.mode), ("Order", p.order_id), ("Authorization", p.authorization_id),
                 ("Status", p.authorization_status), ("Expires", p.expiration_time)]
+        rows += [("Earlier orders", ", ".join(p.previous_order_ids)),
+                 ("Earlier authorizations", ", ".join(p.previous_authorization_ids))]
         rows += [(f"Capture {i}", f"{c.capture_id} · {c.amount} · {'final' if c.final else 'partial'}")
                  for i, c in enumerate(p.captures, 1)]
         dl = "".join(f"<dt>{e(k)}</dt><dd>{e(str(x))}</dd>" for k, x in rows if x)

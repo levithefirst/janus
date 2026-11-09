@@ -94,12 +94,12 @@ def test_partial_captures_part_and_voids_the_rest(j):
     t = job(j)
     packet(j, t)
     t = j.partial(t.id, "15.00")
-    assert t.state == State.VOIDED and t.outcome.action == "partial" and "15.00" in t.outcome.reason
+    assert t.state == State.PARTIALLY_CAPTURED and t.outcome.action == "partial" and "15.00" in t.outcome.reason
     assert [(c.amount, c.final) for c in t.payment.captures] == [("15.00", False)]
     a = auth(j, t)
     assert a["captured"] == "15.00" and a["status"] == "VOIDED"
     kinds = [e["kind"] for e in j.audit.entries(t.id)]
-    assert kinds.index("partial_capture") < kinds.index("void_requested") < kinds.index("voided")
+    assert kinds.index("partial_capture") < kinds.index("void_requested") < kinds.index("partially_captured")
     assert f"janus-{t.id}-void" in {e["data"].get("request_id") for e in j.audit.entries(t.id)}
 
 
@@ -265,5 +265,5 @@ def test_crash_after_partial_capture_recovers_the_void(tmp_path, monkeypatch):
     monkeypatch.undo()
     j2 = Janus(make_config(tmp_path))
     [x] = j2.recover()
-    assert x.state == State.VOIDED and x.outcome.action == "partial"
+    assert x.state == State.PARTIALLY_CAPTURED and x.outcome.action == "partial"
     assert len(j2.paypal._db()["captures"]) == 1 and auth(j2, x)["status"] == "VOIDED"

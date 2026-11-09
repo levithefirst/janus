@@ -92,6 +92,8 @@ From `janus/rules.py`, independent of the policy and the AI:
 6. No automatic capture while a dispute or amendment is open.
 7. In a job, only the customer can capture.
 8. In a job, a flagged packet needs the customer's override for that packet.
+9. One live hold per job: a capture runs only on the current authorization (never one a renewal replaced),
+   and the total captured across all of a job's authorizations never exceeds its price.
 
 Capture amounts must be positive. Every check (pass or block) goes into the audit trail.
 

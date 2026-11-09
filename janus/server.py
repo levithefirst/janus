@@ -56,7 +56,7 @@ API_ROLES = {
     "consent": {BUYER}, "payment": {BUYER}, "authorize": {BUYER}, "release": {BUYER}, "dispute": {BUYER},
     "withdraw_dispute": {BUYER}, "accept_amendment": {BUYER}, "reject_amendment": {BUYER},
     "refund": {SELLER}, "allocations": {SELLER}, "amend": {SELLER}, "photo": {SELLER},
-    "accept": {BUYER}, "partial": {BUYER}, "reject": {BUYER},
+    "accept": {BUYER}, "partial": {BUYER}, "reject": {BUYER}, "renew": {BUYER},
     "evidence": {BUYER, SELLER}, "verify": {BUYER, SELLER}, "settle": {BUYER, SELLER}, "refresh": {BUYER, SELLER},
 }
 READ_ROLES = {BUYER, SELLER, ADMIN}
@@ -479,8 +479,8 @@ def make_handler(j: Janus, limiter: Optional[RateLimiter] = None):
                     raise JanusError("request too large")
                 status, out = handle(j, dict(self.headers.items()), self.rfile.read(n))
                 return self._send(status, out)
-            if len(parts) == 3 and parts[0] == "t" and parts[2] == "pay" and ID.fullmatch(parts[1]):
-                return self._post_pay(parts[1])
+            if len(parts) == 3 and parts[0] == "t" and parts[2] in ("pay", "renew") and ID.fullmatch(parts[1]):
+                return self._post_pay(parts[1], renew=parts[2] == "renew")
             b = self._body()
             cred = self._credential({}, b)
             if parts == ["api", "thresholds"]:
@@ -506,6 +506,11 @@ def make_handler(j: Janus, limiter: Optional[RateLimiter] = None):
                 t, role = self._need(tid, API_ROLES[action], cred)
                 if action == "consent":
                     t = j.consent(tid, channel="api", evidence_from=b.get("evidence_from"))
+                elif action == "renew":
+                    t = j.start_renewal(tid, channel="api")
+                    r = t.payment.renewal
+                    return self._send(200, {"approve_url": r.approve_url if r else None,
+                                            "order_id": r.order_id if r else None, "state": t.state.value})
                 elif action == "payment":
                     t = j.create_payment(tid)
                     return self._send(200, {"buyer_link": j.buyer_link(t), "approve_url": t.payment.approve_url,
@@ -539,8 +544,9 @@ def make_handler(j: Janus, limiter: Optional[RateLimiter] = None):
                 return self._send(200, public(t))
             raise NotFound("route")
 
-        def _post_pay(self, tid: str):
-            """The buyer pressed "Authorize with PayPal": record consent for the terms they were shown, then PayPal."""
+        def _post_pay(self, tid: str, renew: bool = False):
+            """The buyer pressed "Authorize with PayPal" (or, after a hold lapsed, "Approve a new hold"): record
+            consent for the terms they were shown, then send them to PayPal."""
             n = int(self.headers.get("Content-Length") or 0)
             if n > 4096:
                 raise JanusError("request too large")
@@ -549,6 +555,12 @@ def make_handler(j: Janus, limiter: Optional[RateLimiter] = None):
             t, _ = self._need(tid, {BUYER}, cred)
             if not form.get("terms_hash"):
                 raise JanusError("the terms are missing from the request; reload the page")
+            if renew:
+                t = j.start_renewal(tid, terms_hash=form["terms_hash"], channel="web")
+                url = t.payment.renewal.approve_url if t.payment.renewal else None
+                if not url:
+                    raise PayPalError("PayPal did not return an approval link for the new hold. Try again in a moment.")
+                return self._redirect(url, cookie=self._return_cookie(tid, cred))
             if t.state == State.CREATED:
                 t = j.consent(tid, channel="web", terms_hash=form["terms_hash"])
             t = j.create_payment(tid)
@@ -556,9 +568,11 @@ def make_handler(j: Janus, limiter: Optional[RateLimiter] = None):
                 return self._redirect(j.buyer_link(t))
             if not t.payment.approve_url:
                 raise PayPalError("PayPal did not return an approval link for this order. Try again in a moment.")
+            return self._redirect(t.payment.approve_url, cookie=self._return_cookie(tid, cred))
+
+        def _return_cookie(self, tid: str, cred: str) -> str:
             secure = "; Secure" if j.config.base_url.startswith("https") else ""
-            return self._redirect(t.payment.approve_url, cookie=f"janus_{tid}={cred}; Path={j.config.mount}/paypal/return; "
-                                                                f"Max-Age=3600; HttpOnly; SameSite=Lax{secure}")
+            return f"janus_{tid}={cred}; Path={j.config.mount}/paypal/return; Max-Age=3600; HttpOnly; SameSite=Lax{secure}"
 
         def _get(self, parts, q):
             if not parts:
@@ -584,7 +598,7 @@ def make_handler(j: Janus, limiter: Optional[RateLimiter] = None):
                 # the HttpOnly cookie set when they tapped "Authorize", and takes them back to their page.
                 t = j.store.find_by_order(q.get("token", ""))
                 try:
-                    j.authorize(t.id)
+                    j.authorize(t.id, order_id=q.get("token"))
                 except JanusError as ex:
                     return self._send(200, self._legacy(message_page("Not authorized yet", str(ex), "/")), "text/html")
                 bt = self._cookie(f"janus_{t.id}")

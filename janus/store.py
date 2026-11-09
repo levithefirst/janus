@@ -32,6 +32,7 @@ class Consent(BaseModel):
 
 class Capture(BaseModel):
     capture_id: str
+    authorization_id: Optional[str] = None   # which authorization this capture was taken from
     amount: str
     request_id: str
     final: bool
@@ -50,6 +51,8 @@ class Pending(BaseModel):
     items: list[str] = Field(default_factory=list)
     verdict_index: Optional[int] = None   # which verdict justified an automatic capture
     then_void: bool = False               # partial acceptance: void the rest once this capture lands
+    authorization_id: Optional[str] = None  # the authorization this settlement was written for
+    lapse: bool = False                   # job mode: a void that leaves the job open for a new hold
     at: str
 
 
@@ -62,8 +65,22 @@ class Amendment(BaseModel):
     at: str
 
 
+class Renewal(BaseModel):
+    """A fresh authorization for the same job, after the old hold lapsed or could not be reauthorized."""
+    seq: int
+    order_id: str
+    approve_url: Optional[str] = None
+    status: str = "pending"      # pending | done | abandoned | failed
+    reason: str = ""
+    requested_at: str
+    replaced_authorization_id: Optional[str] = None
+    new_authorization_id: Optional[str] = None
+
+
 class Payment(BaseModel):
     order_id: Optional[str] = None
+    previous_order_ids: list[str] = Field(default_factory=list)
+    renewal: Optional[Renewal] = None
     authorized_amount: Optional[str] = None
     approve_url: Optional[str] = None
     authorization_id: Optional[str] = None
@@ -125,6 +142,7 @@ class Threshold(BaseModel):
     allocations: dict[str, str] = Field(default_factory=dict)  # requirement id -> amount (itemized capture)
     item_status: dict[str, str] = Field(default_factory=dict)  # requirement id -> pending|captured|released
     amendment: Optional[Amendment] = None
+    resume_state: Optional[State] = None   # job mode: where a lapsed job resumes once a new hold is authorized
     events: list[dict[str, Any]] = Field(default_factory=list)
 
     @property
@@ -208,7 +226,8 @@ class Store:
 
     def find_by_order(self, order_id: str) -> Threshold:
         for t in self.all():
-            if t.payment.order_id == order_id:
+            r = t.payment.renewal
+            if t.payment.order_id == order_id or (r is not None and r.order_id == order_id):
                 return t
         raise NotFound(f"no threshold for PayPal order {order_id}")
 

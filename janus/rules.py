@@ -12,11 +12,14 @@ policy, the AI, a webhook handler or the scheduler cannot capture money if a rul
 7. Job mode: only the customer can capture; the AI's acceptance packet is advice.
 8. Job mode: a packet with blocking flags (reused or edited photo, wrong room, no AI packet, and so on)
    cannot be captured unless the customer recorded an override, with a reason, for that exact packet.
+9. One job, one live hold: a capture only runs on the job's current authorization (never one a renewal
+   replaced), and the total captured across every authorization the job ever had never exceeds its price.
 """
 from __future__ import annotations
 
 import hashlib
 import json
+from decimal import Decimal
 from typing import TYPE_CHECKING
 
 from .clock import parse, utcnow
@@ -60,6 +63,18 @@ def check_capture(t: "Threshold", by: str, min_confidence_floor: float) -> None:
     """Raise RuleViolation unless capturing now is allowed. `by` is who initiated the capture."""
     check_not_terminal(t)
     p = t.payment
+    # 9. one live hold: only the current authorization, never more than the price in total
+    pend = t.pending
+    if t.state == State.HOLD_LAPSED or not p.authorization_id or p.authorization_id in p.previous_authorization_ids:
+        raise RuleViolation("stale_authorization", "the job has no live hold to capture from")
+    if pend is not None and pend.authorization_id and pend.authorization_id != p.authorization_id:
+        raise RuleViolation("stale_authorization", f"this capture was written for authorization "
+                                                   f"{pend.authorization_id}, which is no longer the job's hold")
+    captured = sum((Decimal(c.amount) for c in p.captures), Decimal("0"))
+    asked = Decimal(pend.amount) if pend is not None and pend.amount else Decimal(t.amount) - captured
+    if captured + asked > Decimal(t.amount):
+        raise RuleViolation("over_capture", f"{captured} already captured; {asked} more would exceed the "
+                                            f"price {t.amount}")
     # 3. never after a void or expiry
     if t.ever_voided_or_expired or p.voided or p.authorization_status in ("VOIDED", "EXPIRED"):
         raise RuleViolation("no_capture_after_void_or_expiry", "the authorization was voided or expired")
