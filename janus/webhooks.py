@@ -11,7 +11,6 @@ authorization from PayPal and moves the threshold forward only along the state m
 from __future__ import annotations
 
 import json
-import os
 import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
@@ -26,19 +25,17 @@ EVENT_ID = re.compile(r"^[A-Za-z0-9-]{1,80}$")
 
 
 class Inbox:
-    def __init__(self, data_dir: Path):
-        self.dir = Path(data_dir) / "webhooks"
-        self.dir.mkdir(parents=True, exist_ok=True)
+    """Webhook event ids already processed. A claim is an atomic create-if-absent in the storage backend."""
+
+    def __init__(self, store):
+        from .kv import Backend, FileBackend
+        self.kv = store if isinstance(store, Backend) else FileBackend(Path(store))
 
     def claim(self, event_id: str) -> bool:
-        try:
-            os.close(os.open(self.dir / f"{event_id}.seen", os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
-            return True
-        except FileExistsError:
-            return False
+        return self.kv.add(f"webhooks/{event_id}.seen")
 
     def release(self, event_id: str) -> None:
-        (self.dir / f"{event_id}.seen").unlink(missing_ok=True)
+        self.kv.delete(f"webhooks/{event_id}.seen")
 
 
 def _related(resource: dict) -> set[str]:

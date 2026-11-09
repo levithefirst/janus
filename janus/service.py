@@ -95,18 +95,20 @@ class Janus:
     def __init__(self, config: Config, ai=None, paypal=None):
         self.config = config
         setup(config.data_dir)
-        self.store = Store(config.data_dir)
-        self.audit = AuditLog(config.data_dir)
+        from .kv import from_config
+        self.kv = from_config(config)
+        self.store = Store(self.kv, Path(config.data_dir) / "cache")
+        self.audit = AuditLog(self.kv)
         self.security = Security(load_secret(config.janus_secret, allow_ephemeral=config.paypal_mode == "mock"),
                                  parse_keys(config.tenant_keys), config.admin_token)
-        self.phash_index = ev.PhashIndex(config.data_dir)
+        self.phash_index = ev.PhashIndex(self.kv)
         from .webhooks import Inbox
-        self.inbox = Inbox(config.data_dir)
+        self.inbox = Inbox(self.kv)
         self.ai = ai or (ClaudeAI(config.model) if config.ai_mode == "claude" else MockAI())
         self.paypal = paypal or (
             PayPalSandbox(config.paypal_client_id, config.paypal_client_secret,
                           negative_test=config.paypal_negative_test)
-            if config.paypal_mode == "sandbox" else PayPalMock(config.data_dir, config.paypal_negative_test))
+            if config.paypal_mode == "sandbox" else PayPalMock(self.kv, config.paypal_negative_test))
 
     @classmethod
     def from_env(cls) -> "Janus":
@@ -136,9 +138,7 @@ class Janus:
     def _ingest(self, t: Threshold, image: ImageInput, subdir: str, stem: str) -> tuple[str, str, str]:
         raw = Path(image).read_bytes() if isinstance(image, (str, Path)) else image
         data, media_type, ext = normalize_image(raw)
-        d = self.store.dir(t.id) / subdir
-        d.mkdir(parents=True, exist_ok=True)
-        (d / f"{stem}{ext}").write_bytes(data)
+        self.store.put_file(t.id, f"{subdir}/{stem}{ext}", data)
         return f"{subdir}/{stem}{ext}", media_type, hashlib.sha256(data).hexdigest()
 
     def get(self, tid: str) -> Threshold:

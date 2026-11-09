@@ -555,11 +555,15 @@ def make_handler(j: Janus, limiter: Optional[RateLimiter] = None):
                     path = f"/t/{tid}/files/{parts[3]}/{quote(parts[4])}"
                     if not j.security.check_signed(path, q.get("exp"), q.get("sig")):
                         raise NotFound(tid)
-                    f = (j.store.dir(tid) / parts[3] / parts[4]).resolve()
-                    if f.parent != (j.store.dir(tid) / parts[3]).resolve() or not f.is_file():
+                    name = parts[4]
+                    if "/" in name or name.startswith(".") or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", name):
                         raise NotFound(tid)
-                    ctype = "image/jpeg" if f.suffix in (".jpg", ".jpeg") else f"image/{f.suffix[1:]}"
-                    return self._send(200, f.read_bytes(), ctype)
+                    data = j.store.get_file(tid, f"{parts[3]}/{name}")
+                    if data is None:
+                        raise NotFound(tid)
+                    ext = name.rsplit(".", 1)[-1].lower()
+                    ctype = "image/jpeg" if ext in ("jpg", "jpeg") else f"image/{ext}"
+                    return self._send(200, data, ctype)
                 t, role = self._need(tid, {BUYER, SELLER}, cred)
                 if len(parts) == 2:
                     return self._send(200, threshold_page(j, self._view(tid), role == SELLER), "text/html")

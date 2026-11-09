@@ -17,7 +17,6 @@ The result is a `Trust`: extra confidence needed on top of the base threshold, p
 """
 from __future__ import annotations
 
-import fcntl
 import io
 import json
 import math
@@ -148,29 +147,23 @@ def phash_of_file(path: Path) -> Optional[str]:
 # ---------------- cross-job reuse index ----------------
 
 class PhashIndex:
-    def __init__(self, data_dir: Path):
-        self.path = Path(data_dir) / "phash_index.jsonl"
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.touch(exist_ok=True)
+    STREAM = "phash_index"
+
+    def __init__(self, store):
+        from .kv import Backend, FileBackend
+        self.kv = store if isinstance(store, Backend) else FileBackend(Path(store))
+
+    def entries(self) -> list[dict]:
+        return self.kv.stream(self.STREAM)
 
     def add_and_match(self, threshold_id: str, evidence_id: str, phash: str) -> list[dict]:
         """Record this hash and return near-duplicates from OTHER jobs, atomically."""
-        with self.path.open("a+") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
-            try:
-                f.seek(0)
-                hits = []
-                for line in f:
-                    if line.strip():
-                        e = json.loads(line)
-                        if e["threshold_id"] != threshold_id and hamming(e["phash"], phash) <= REUSE_MAX_DISTANCE:
-                            hits.append(e)
-                f.seek(0, 2)
-                f.write(json.dumps({"threshold_id": threshold_id, "evidence_id": evidence_id, "phash": phash,
-                                    "at": iso()}) + "\n")
-                return hits
-            finally:
-                fcntl.flock(f, fcntl.LOCK_UN)
+        with self.kv.lock(f"index:{self.STREAM}"):
+            hits = [e for e in self.entries()
+                    if e["threshold_id"] != threshold_id and hamming(e["phash"], phash) <= REUSE_MAX_DISTANCE]
+            self.kv.append(self.STREAM, lambda last: {"threshold_id": threshold_id, "evidence_id": evidence_id,
+                                                      "phash": phash, "at": iso()})
+            return hits
 
 
 # ---------------- trust ----------------
