@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Optional
 
 from .constants import DEFAULT_MIN_CONFIDENCE
-from .models import EvidenceItem, Listing
+from .models import EvidenceItem, Listing, Verdict
 from .policy import decide
 
 BUCKETS = [(0.0, 0.5), (0.5, DEFAULT_MIN_CONFIDENCE), (DEFAULT_MIN_CONFIDENCE, 1.0001)]
@@ -72,8 +72,13 @@ def run(ai, labels_path: Path, root: Path, work: Path, min_confidence: float = D
         (work / name).write_bytes(raw)
         from .evidence import analyze
         gate = analyze(raw)
-        ev = [EvidenceItem(id="V1", file=name, media_type="image/jpeg")]
-        v = ai.verify(compiled, listing, ev, work)
+        ev = [EvidenceItem(id="V1", file=name, media_type="image/jpeg", phash=gate["phash"],
+                           quality={"ok": gate["quality_ok"], "sharpness": gate["sharpness"]})]
+        if gate["quality_ok"]:
+            v = ai.verify(compiled, listing, ev, work)
+        else:  # the real pipeline never calls the model on a gate hard-fail; neither does the harness
+            v = Verdict(verdict="uncertain", confidence=0.0, checks=[], summary="quality gate: not judged",
+                        next_step="Retake the photo.")
         action = decide(v, compiled, min_confidence).action
         label = case["label"]
         rows.append({"id": case["id"], "label": label, "verdict": v.verdict, "confidence": round(v.confidence, 3),

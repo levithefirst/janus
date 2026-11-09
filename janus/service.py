@@ -102,7 +102,7 @@ class Janus:
         self.phash_index = ev.PhashIndex(config.data_dir)
         from .webhooks import Inbox
         self.inbox = Inbox(config.data_dir)
-        self.ai = ai or (ClaudeAI(config.model) if config.ai_mode == "claude" else MockAI())
+        self.ai = ai or (ClaudeAI(config.model, image_max_edge=config.image_max_edge) if config.ai_mode == "claude" else MockAI())
         self.paypal = paypal or (
             PayPalSandbox(config.paypal_client_id, config.paypal_client_secret,
                           negative_test=config.paypal_negative_test)
@@ -396,6 +396,11 @@ class Janus:
             if trust.hold_reasons:
                 return self._gate_hold(t, "integrity", trust.hold_reasons, bar, trust, evidence_by,
                                        "A person needs to review this evidence before any money moves.")
+            gps = [f for f in trust.flags if f in ("gps_far_from_delivery", "gps_inconsistent")]
+            if gps:  # a hard fail: never spend a model call on evidence from the wrong place
+                return self._gate_hold(t, "location", [f"photo location check failed ({', '.join(gps)})"], bar,
+                                       trust, evidence_by, "Take the photo where the item was delivered, "
+                                                           "or ask a person to review it.")
             verdict = self.ai.verify(t.compiled, t.listing, t.evidence, self.store.dir(t.id), ref=t.id)
             consent = rules.valid_consent(t, ("auto_capture_on_verified", "amendment"))
             may_capture = consent is not None and evidence_by in consent.evidence_from

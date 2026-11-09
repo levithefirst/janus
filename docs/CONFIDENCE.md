@@ -17,7 +17,7 @@ Money moves only when every one of these holds (see `policy.py` and `rules.py`):
 
 1. Confidence is at or above the bar: `JANUS_MIN_CONFIDENCE` (default 0.85) **plus** an evidence
    trust penalty. No EXIF: +0.05. EXIF time with no zone near the authorization: +0.02. GPS far from
-   the delivery point, or inconsistent across photos: +0.10. The bar never goes above 0.99, and
+   the delivery point, or inconsistent across photos: a hard fail (hold, the model is not called). The bar never goes above 0.99, and
    present, plausible EXIF never lowers it.
 2. The verdict agrees with its own per-requirement checks (a `met` verdict with a failed or
    unchecked critical requirement is a HOLD).
@@ -74,6 +74,15 @@ quality gate (a bug in the blur measure, fixed in `45901ea`).
   | 0.85-1.00 | 6 | 100% | 0.90 |
 
   With 12 synthetic cases these numbers catch regressions only. They are not an accuracy claim.
+
+- **Live Claude, verify-v2 (per-item answers, short output), 12 synthetic cases** (branch `cost-cuts`,
+  run 2026-11-09, `claude-opus-5-5`, photos at most 1024 px, bar 0.85):
+  - Accuracy 12 of 12. Unsafe money movements: 0 (bare model and after the gate).
+  - Brier 0.2394, ECE 0.3875. Needless holds: 5 of 5 matches held (confidence 0.60 to 0.65), worse
+    than the v1 prompt (4 of 5). Code takes the lowest required-item confidence, and the model is unsure
+    about "no chips or cracks" from a single front photo.
+  - The two gate-blocked cases no longer call the model.
+  - At 768 px the same set scored 7 of 12 (all five matches became uncertain), so 1024 px stays.
 
 ### What a real calibration needs
 

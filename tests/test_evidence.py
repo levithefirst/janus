@@ -109,14 +109,16 @@ def test_exif_without_zone_near_authorization_is_ambiguous_not_fatal(j):
     assert last(j, t).min_confidence == 0.87 and "exif_time_ambiguous" in last(j, t).trust_flags
 
 
-def test_gps_far_from_delivery_raises_bar(j):
+def test_gps_far_from_delivery_is_a_hard_fail_without_asking_ai(j):
     t = authorized(j)
     with j.store.lock(t.id):
         x = j.get(t.id)
         x.delivery_location = [51.5, -0.12]     # London
         j.store.save(x)
-    j.submit_and_verify(t.id, with_exif("received_match.jpg", gps=(48.85, 2.35)))  # Paris
-    assert "gps_far_from_delivery" in last(j, t).trust_flags and last(j, t).min_confidence == 0.95
+    t = j.submit_and_verify(t.id, with_exif("received_match.jpg", gps=(48.85, 2.35)))  # Paris
+    assert t.state == State.HELD and CountingAI.calls == 0
+    assert last(j, t).source == "location" and "gps_far_from_delivery" in last(j, t).trust_flags
+    assert last(j, t).verdict.next_step
 
 
 def test_gps_is_rounded_and_never_logged(j):

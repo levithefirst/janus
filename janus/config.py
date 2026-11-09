@@ -37,6 +37,7 @@ class Config:
     tenant_keys: str = ""         # "tenant:key,..." provider API keys (env only)
     admin_token: str = ""         # read-only operator access (env only)
     public_create: bool = True    # anyone may create thresholds in the "public" tenant (rate limited)
+    image_max_edge: int = 1024    # photos sent to the verifier are downscaled to this long edge (no crop)
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -64,4 +65,5 @@ class Config:
             tenant_keys=env("JANUS_TENANT_KEYS", ""),
             admin_token=env("JANUS_ADMIN_TOKEN", ""),
             public_create=env("JANUS_PUBLIC_CREATE", "1") == "1",
+            image_max_edge=int(env("JANUS_IMAGE_MAX_EDGE", "1024")),
         )
