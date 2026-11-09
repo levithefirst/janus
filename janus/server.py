@@ -39,9 +39,10 @@ from .logs import log_event
 from . import rules
 from .rules import RuleViolation
 from .paypal import PayPalError
-from .service import Janus, JanusError, StaleTermsError
+from .service import Janus, JanusError, OverrideRequired, StaleTermsError
 from .state import HOLDS_FUNDS, State, TransitionError
 from .security import RateLimiter
+from . import web_jobs
 from .store import NotFound, Threshold
 
 STATIC = Path(__file__).parent / "static"
@@ -54,7 +55,8 @@ BUYER, SELLER, ADMIN = "buyer", "seller", "admin"
 API_ROLES = {
     "consent": {BUYER}, "payment": {BUYER}, "authorize": {BUYER}, "release": {BUYER}, "dispute": {BUYER},
     "withdraw_dispute": {BUYER}, "accept_amendment": {BUYER}, "reject_amendment": {BUYER},
-    "refund": {SELLER}, "allocations": {SELLER}, "amend": {SELLER},
+    "refund": {SELLER}, "allocations": {SELLER}, "amend": {SELLER}, "photo": {SELLER},
+    "accept": {BUYER}, "partial": {BUYER}, "reject": {BUYER},
     "evidence": {BUYER, SELLER}, "verify": {BUYER, SELLER}, "settle": {BUYER, SELLER}, "refresh": {BUYER, SELLER},
 }
 READ_ROLES = {BUYER, SELLER, ADMIN}
@@ -354,11 +356,22 @@ def make_handler(j: Janus, limiter: Optional[RateLimiter] = None):
             self.wfile.write(data)
 
         def _redirect(self, url: str, cookie: str = ""):
+            if url.startswith("/") and not url.startswith("//"):
+                url = j.config.mount + url
             self.send_response(303)
             self.send_header("Location", url)
             if cookie:
                 self.send_header("Set-Cookie", cookie)
             self.end_headers()
+
+        def _legacy(self, page_html: str) -> str:
+            """The threshold pages use root-relative URLs; prefix them when the app is mounted (e.g. /app)."""
+            m = j.config.mount
+            if not m:
+                return page_html
+            for a in (' href="/', ' src="/', ' action="/', "post('/", "act('/"):
+                page_html = page_html.replace(a, a[:-1] + m + "/")
+            return page_html
 
         def _cookie(self, name: str) -> Optional[str]:
             from http.cookies import SimpleCookie
@@ -398,11 +411,15 @@ def make_handler(j: Janus, limiter: Optional[RateLimiter] = None):
         def _bucket(self, method: str, parts: list[str]) -> str:
             if parts == ["paypal", "webhook"]:
                 return "webhook"
-            if method == "POST" and (parts == ["api", "thresholds"] or parts[-1:] in (["evidence"], ["verify"])):
+            if method == "POST" and (parts in (["api", "thresholds"], ["api", "jobs"])
+                                     or parts[-1:] in (["evidence"], ["verify"], ["photo"])):
                 return "expensive"  # these call the AI
             return "write" if method == "POST" else "read"
 
         def _dispatch(self, method: str):
+            m = j.config.mount
+            if m and (self.path == m or self.path.startswith(m + "/") or self.path.startswith(m + "?")):
+                self.path = self.path[len(m):] or "/"
             url = urlparse(self.path)
             q = {k: v[0] for k, v in parse_qs(url.query).items()}
             parts = [p for p in url.path.split("/") if p]
@@ -422,7 +439,7 @@ def make_handler(j: Janus, limiter: Optional[RateLimiter] = None):
                 self._err(api, 404, "not found")
             except TransitionError as ex:
                 self._err(api, 409, str(ex))
-            except StaleTermsError as ex:
+            except (StaleTermsError, OverrideRequired) as ex:
                 self._err(api, 409, str(ex))
             except (JanusError, RuleViolation) as ex:
                 self._err(api, 400, str(ex))
@@ -432,7 +449,7 @@ def make_handler(j: Janus, limiter: Optional[RateLimiter] = None):
         def _err(self, api: bool, status: int, msg: str):
             if api:
                 return self._send(status, {"error": msg})
-            self._send(status, message_page("Not found" if status == 404 else "Something went wrong", msg),
+            self._send(status, self._legacy(message_page("Not found" if status == 404 else "Something went wrong", msg)),
                        "text/html")
 
         def do_GET(self):
@@ -476,6 +493,14 @@ def make_handler(j: Janus, limiter: Optional[RateLimiter] = None):
                              tenant=tenant or "public")
                 return self._send(201, {"id": t.id, "buyer_link": j.buyer_link(t),
                                         "seller_link": j.seller_link(t), "threshold": public(t)})
+            if parts == ["api", "jobs"]:
+                tenant = j.security.tenant_of_key(cred)
+                if tenant is None and not j.config.public_create:
+                    return self._send(401, {"error": "a tenant key is required to create jobs"})
+                t = j.create_job(b.get("title", ""), str(b.get("price", "")), b.get("description", ""),
+                                 b.get("currency") or "USD", tenant=tenant or "public")
+                return self._send(201, {"id": t.id, "customer_link": j.buyer_link(t),
+                                        "provider_link": j.seller_link(t), "job": public(t)})
             if parts[:2] == ["api", "t"] and len(parts) == 4 and ID.fullmatch(parts[2]) and parts[3] in API_ROLES:
                 tid, action = parts[2], parts[3]
                 t, role = self._need(tid, API_ROLES[action], cred)
@@ -504,6 +529,12 @@ def make_handler(j: Janus, limiter: Optional[RateLimiter] = None):
                         "allocations": lambda: j.set_allocations(tid, b.get("allocations") or {}),
                         "amend": lambda: j.propose_amendment(tid, b.get("condition"), b.get("price"),
                                                              b.get("reason", "")),
+                        "photo": lambda: j.submit_evidence(tid, _b64(b.get("photo_b64") or ""), b.get("note", ""),
+                                                           by=role, phase=b.get("phase")),
+                        "accept": lambda: j.accept(tid, b.get("override_reason", ""), channel="api"),
+                        "partial": lambda: j.partial(tid, str(b.get("amount", "")), b.get("override_reason", ""),
+                                                     channel="api"),
+                        "reject": lambda: j.reject(tid, b.get("reason", ""), channel="api"),
                     }[action]()
                 return self._send(200, public(t))
             raise NotFound("route")
@@ -524,12 +555,22 @@ def make_handler(j: Janus, limiter: Optional[RateLimiter] = None):
             if t.state != State.PAYMENT_PENDING or not t.payment.approve_url:
                 return self._redirect(j.buyer_link(t))
             secure = "; Secure" if j.config.base_url.startswith("https") else ""
-            return self._redirect(t.payment.approve_url, cookie=f"janus_{tid}={cred}; Path=/paypal/return; "
+            return self._redirect(t.payment.approve_url, cookie=f"janus_{tid}={cred}; Path={j.config.mount}/paypal/return; "
                                                                 f"Max-Age=3600; HttpOnly; SameSite=Lax{secure}")
 
         def _get(self, parts, q):
             if not parts:
-                return self._send(200, landing(j), "text/html")
+                return self._send(200, web_jobs.home(j), "text/html")
+            if parts == ["threshold"]:
+                return self._send(200, self._legacy(landing(j)), "text/html")
+            if parts == ["cron", "tick"]:
+                # Vercel Cron sends "Authorization: Bearer <CRON_SECRET>". Without a configured secret, refuse.
+                auth = self.headers.get("Authorization") or ""
+                import hmac as _h
+                if not j.config.cron_secret or not _h.compare_digest(auth, f"Bearer {j.config.cron_secret}"):
+                    raise NotFound("route")
+                from .scheduler import tick
+                return self._send(200, {"actions": tick(j)})
             if parts == ["logo.svg"]:
                 return self._send(200, (STATIC / "logo.svg").read_bytes(), "image/svg+xml")
             if parts == ["healthz"]:
@@ -543,12 +584,13 @@ def make_handler(j: Janus, limiter: Optional[RateLimiter] = None):
                 try:
                     j.authorize(t.id)
                 except JanusError as ex:
-                    return self._send(200, message_page("Not authorized yet", str(ex), "/"), "text/html")
+                    return self._send(200, self._legacy(message_page("Not authorized yet", str(ex), "/")), "text/html")
                 bt = self._cookie(f"janus_{t.id}")
                 if j.role_for(t, bt) == BUYER:
                     return self._redirect(f"/t/{t.id}?t={quote(bt)}")
-                return self._send(200, message_page("Payment authorized", "PayPal is holding the money. Go back "
-                                                    "to the link the seller sent you to continue.", "/"), "text/html")
+                return self._send(200, self._legacy(message_page(
+                    "Payment authorized", "PayPal is holding the money. Go back to the link the provider sent you "
+                    "to continue.", "/")), "text/html")
             if len(parts) >= 2 and parts[0] == "t" and ID.fullmatch(parts[1]):
                 tid = parts[1]
                 if len(parts) == 5 and parts[2] == "files" and parts[3] in ("listing", "evidence"):
@@ -566,7 +608,10 @@ def make_handler(j: Janus, limiter: Optional[RateLimiter] = None):
                     return self._send(200, data, ctype)
                 t, role = self._need(tid, {BUYER, SELLER}, cred)
                 if len(parts) == 2:
-                    return self._send(200, threshold_page(j, self._view(tid), role == SELLER), "text/html")
+                    t = self._view(tid)
+                    if t.kind == "job":
+                        return self._send(200, web_jobs.job_page(j, t, role), "text/html")
+                    return self._send(200, self._legacy(threshold_page(j, t, role == SELLER)), "text/html")
                 if parts[2:] == ["pay"] and role == BUYER:
                     # A GET only shows the terms. Link previews and prefetchers issue GETs, so a GET must never
                     # record consent or create an order: that is the POST below.

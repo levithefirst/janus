@@ -812,7 +812,7 @@ class Janus:
         if target == State.VOIDED and t.payment.captures and t.kind == "job":
             captured = sum((Decimal(c.amount) for c in t.payment.captures), Decimal("0"))
             outcome = Outcome(action="partial", by=outcome.by, at=outcome.at,
-                              reason=f"Captured {captured} {t.currency}; the rest of the hold was voided. {outcome.reason}")
+                              reason=f"Captured {captured} of {t.amount} {t.currency}; the rest of the hold was voided.")
         t.outcome = outcome
         t.pending = None
         t.payment.last_error = None
