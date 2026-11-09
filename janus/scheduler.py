@@ -3,7 +3,8 @@
     day 0     authorized
     day 2.5   warn: honor period ends in 12 hours           (WARN_BEFORE_HONOR)
     day 3     reauthorize, or ask the customer for a new authorization
-    day 28    void, so funds are released before PayPal expires the authorization (VOID_BEFORE_EXPIRY)
+    day 27    void, so funds are released before PayPal expires the authorization (VOID_BEFORE_EXPIRY, 48 h:
+              a once-a-day cron still lands inside the window)
     day 29    PayPal expiry (AUTH_EXPIRY_DAYS)
 
 Run it with `python -m janus tick` from cron, or it runs every JANUS_TICK_SECONDS inside `serve`.
