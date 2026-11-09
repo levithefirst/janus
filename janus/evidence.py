@@ -69,7 +69,7 @@ def note_flags(note: str) -> list[str]:
 # ---------------- image analysis ----------------
 
 def _exif(img) -> dict:
-    out = {"present": False, "taken_at": None, "offset": None, "gps": None}
+    out = {"present": False, "taken_at": None, "offset": None, "gps": None, "software": None}
     try:
         ex = img.getexif()
     except Exception:
@@ -77,6 +77,9 @@ def _exif(img) -> dict:
     if not ex:
         return out
     out["present"] = True
+    sw = ex.get(305)  # Software: editors write their name here
+    if isinstance(sw, str) and sw.strip():
+        out["software"] = sw.strip()[:80]
     sub = ex.get_ifd(0x8769) or {}
     raw = sub.get(36867) or sub.get(36868) or ex.get(306)  # DateTimeOriginal, DateTimeDigitized, DateTime
     if isinstance(raw, str):
@@ -245,3 +248,68 @@ def assess(evidence: list, authorized_at: Optional[str], delivery_location: Opti
         t.penalty += PENALTY_GPS
         t.flags.append("gps_inconsistent")
     return t
+
+
+# ---------------- job mode: before / after ----------------
+
+# Software tags that mean the file passed through an editor. Phone camera firmware also writes this tag
+# (e.g. "iOS 17.4", "G9910XXU2BWK1"), so only names of editing tools count.
+EDITORS = re.compile(r"photoshop|lightroom|gimp|affinity|pixelmator|snapseed|picsart|facetune|canva|"
+                     r"luminar|photopea|fotor|polarr|vsco|airbrush|retouch|remini|faceapp|meitu|pixlr", re.I)
+
+
+@dataclass
+class JobCheck:
+    blocking: list[str] = field(default_factory=list)   # capture needs a logged customer override
+    info: list[str] = field(default_factory=list)       # shown, and raise the confidence bar
+    penalty: float = 0.0
+
+
+def job_flags(evidence: list, authorized_at: Optional[str]) -> JobCheck:
+    """Integrity flags for a job's before and after photos. Deterministic: no AI involved."""
+    jc = JobCheck()
+    before = [e for e in evidence if e.phase == "before" and e.file]
+    after = [e for e in evidence if e.phase == "after" and e.file]
+
+    def block(flag: str) -> None:
+        if flag not in jc.blocking:
+            jc.blocking.append(flag)
+    if not before:
+        block("no_before_photo")
+    if not after:
+        block("no_after_photo")
+    for e in before + after:
+        for f in e.flags:
+            if f.startswith("reused_photo"):
+                block(f"reused_photo:{e.id}")
+            elif f == "instruction_like_note":
+                block(f"instruction_like_note:{e.id}")
+        sw = (e.exif or {}).get("software")
+        if sw and EDITORS.search(sw):
+            block(f"edited_software:{e.id}")
+    for a in after:
+        for b in before:
+            if a.phash and b.phash and hamming(a.phash, b.phash) <= REUSE_MAX_DISTANCE:
+                block(f"after_matches_before:{a.id}")
+    auth = parse(authorized_at)
+    times = {}
+    for e in before + after:
+        taken, zone_known = exif_time_utc(e.exif or {})
+        if taken is not None:
+            times[e.id] = (taken, EXIF_SKEW_WITH_OFFSET if zone_known else EXIF_SKEW_NO_OFFSET)
+            if taken > utcnow() + times[e.id][1]:
+                block(f"taken_in_future:{e.id}")
+    for a in after:
+        if a.id in times and auth and times[a.id][0] < auth - times[a.id][1]:
+            block(f"after_taken_before_authorization:{a.id}")
+    b_times = [times[b.id] for b in before if b.id in times]
+    for a in after:
+        if a.id in times and b_times:
+            latest_before = max(t for t, _ in b_times)
+            if times[a.id][0] < latest_before - max(times[a.id][1], max(sk for _, sk in b_times)):
+                block(f"after_older_than_before:{a.id}")
+    for a in after:
+        if not (a.exif or {}).get("present"):
+            jc.info.append(f"no_exif:{a.id}")
+            jc.penalty = max(jc.penalty, PENALTY_NO_EXIF)
+    return jc

@@ -19,13 +19,15 @@ if TYPE_CHECKING:
 
 class Consent(BaseModel):
     """An explicit customer decision, bound to the exact terms it was given for."""
-    kind: str            # auto_capture_on_verified | release | amendment
+    kind: str            # auto_capture_on_verified | hold | release | amendment | override
     by: str              # always the customer (buyer); recorded for the audit trail
     at: str
     terms_hash: str
     amount: str
     channel: str         # web | api | cli
     evidence_from: list[str] = Field(default_factory=lambda: ["buyer"])  # whose evidence may auto-capture
+    verdict_index: Optional[int] = None   # override: the packet whose flags the customer overrode
+    reason: str = ""                      # override: the customer's stated reason
 
 
 class Capture(BaseModel):
@@ -47,6 +49,7 @@ class Pending(BaseModel):
     final: bool = True
     items: list[str] = Field(default_factory=list)
     verdict_index: Optional[int] = None   # which verdict justified an automatic capture
+    then_void: bool = False               # partial acceptance: void the rest once this capture lands
     at: str
 
 
@@ -88,8 +91,9 @@ class VerdictRecord(BaseModel):
     reason: str
     min_confidence: float = 0.85          # the bar this verdict had to clear (base + evidence trust penalty)
     evidence_by: str = "buyer"            # who submitted the evidence the verdict is about
-    source: str = "ai"                    # ai | quality_gate | integrity
+    source: str = "ai"                    # ai | quality_gate | integrity | ai_unavailable
     trust_flags: list[str] = Field(default_factory=list)
+    blocking_flags: list[str] = Field(default_factory=list)  # job mode: capture needs a logged customer override
 
 
 class Outcome(BaseModel):
@@ -103,6 +107,7 @@ class Threshold(BaseModel):
     id: str
     version: int = 0             # compare-and-set: bumped on every save
     tenant: str = "public"       # tokens are bound to it; a tenant key only reaches its own thresholds
+    kind: str = "threshold"      # threshold (AI may settle under consent) | job (only the customer decides)
     state: State
     created_at: str
     updated_at: str

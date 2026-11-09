@@ -9,6 +9,9 @@ policy, the AI, a webhook handler or the scheduler cannot capture money if a rul
 4. Nothing changes a threshold in a terminal state (also enforced by Store.save).
 5. A silent customer never triggers a capture: the scheduler and webhooks cannot capture.
 6. No automatic capture while a dispute is open or an amendment is waiting for consent.
+7. Job mode: only the customer can capture; the AI's acceptance packet is advice.
+8. Job mode: a packet with blocking flags (reused or edited photo, wrong room, no AI packet, and so on)
+   cannot be captured unless the customer recorded an override, with a reason, for that exact packet.
 """
 from __future__ import annotations
 
@@ -67,6 +70,18 @@ def check_capture(t: "Threshold", by: str, min_confidence_floor: float) -> None:
     if by in NEVER_CAPTURE or (by != AUTO and by not in HUMAN_CAPTURERS):
         raise RuleViolation("silent_customer", f"'{by}' may not capture; only a verified condition "
                                                "or the customer can")
+    if t.kind == "job":
+        # 7. job mode: only the customer decides; the AI's packet never moves money
+        if by not in HUMAN_CAPTURERS:
+            raise RuleViolation("customer_decides", "in a job only the customer can capture")
+        # 8. a flagged packet cannot be captured without an explicit, recorded customer override
+        if t.verdicts and t.verdicts[-1].blocking_flags:
+            idx = len(t.verdicts) - 1
+            h = terms_hash(t)
+            if not any(c.kind == "override" and c.verdict_index == idx and c.terms_hash == h and c.by == "buyer"
+                       and c.reason.strip() for c in t.consents):
+                raise RuleViolation("flags_need_override", "the packet is flagged ("
+                                    + ", ".join(t.verdicts[-1].blocking_flags) + "); the customer must override it")
     if by in HUMAN_CAPTURERS:
         # 1. explicit release by the customer, bound to the current terms
         if not valid_consent(t, ("release",)):
