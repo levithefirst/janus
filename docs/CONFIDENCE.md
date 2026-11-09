@@ -56,8 +56,24 @@ quality gate (a bug in the blur measure, fixed in `45901ea`).
 
 - **Mock AI** (`calibration/report-mock.md`): 0 unsafe settlements after the gate. The mock compares
   colours, so this says nothing about Claude.
-- **Claude:** not run yet. It needs `ANTHROPIC_API_KEY`. Run `JANUS_AI=claude python -m janus calibrate`
-  and commit `calibration/report-claude.md`.
+- **Live Claude on 12 synthetic cases** (`calibration/report-claude.md`, model `claude-opus-5-5`,
+  run 2026-11-09, bar 0.85):
+  - Accuracy: 12 of 12 (100%).
+  - Unsafe money movements: **0** for the bare model and **0** after the quality gate.
+  - Brier score: 0.0352. ECE (3 bins): 0.165.
+  - Needless holds on clear cases: 4. Four of the five correct `met` cases came back at 0.80 to 0.82,
+    below the bar, so they were held instead of captured. Claude was correct but under-confident on
+    matches here, which is the safe direction.
+  - The quality gate blocked both degraded photos (`blurred`, `dark-blurry`) even though Claude gave them
+    0.80 and 0.85 as `uncertain`.
+
+  | Confidence | n | Accuracy | Mean confidence |
+  |---|---|---|---|
+  | 0.00-0.50 | 0 | n/a | n/a |
+  | 0.50-0.85 | 6 | 100% | 0.77 |
+  | 0.85-1.00 | 6 | 100% | 0.90 |
+
+  With 12 synthetic cases these numbers catch regressions only. They are not an accuracy claim.
 
 ### What a real calibration needs
 
