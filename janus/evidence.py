@@ -118,6 +118,27 @@ THUMB = (32, 24)
 # Measured on the synthetic scenes (eval/scenes.py): true copies, resized to 70-95% or brightness +-10%,
 # reach 4.32; different photos whose 64-bit hashes collide go as low as 2.61. The ranges overlap, so the two
 # checks get different thresholds, chosen by what a mistake costs:
+# Noise consistency (a pixel-level edit check that needs no AI). One exposure from one sensor has roughly
+# the same fine-grain noise everywhere that is not clipped. A pasted, blurred, cloned or inpainted area has
+# been resampled and is much smoother than the rest. We measure noise per 16 px block as the mean absolute
+# difference from a 3x3 median filter, and look for one connected smooth area.
+#   NOISE_LOW_RATIO 0.4: a block counts as smooth below 40% of the photo's median block noise. Resampling
+#     with any blur removes most of the noise (well under half); ordinary block-to-block variation stays
+#     within about +-30% of the median, so 0.4 leaves a margin on both sides.
+#   SMOOTH_REGION_MAX 0.015: flag when one connected smooth area covers 1.5% of the frame or more (about
+#     120x90 px at 960x720). Chosen on a separate calibration set (eval/calibrate_noise.py: 60 fresh
+#     synthetic after photos and 60 pastes of random size with a 0.8 to 1.5 px blur), not on the 13 eval
+#     cases: the largest smooth area on a genuine photo was 0.6% of the frame, the smallest on a blurred
+#     paste 1.7%. Synthetic scenes only; real phone photos have not been measured.
+#   NOISE_MIN_MEDIAN 0.5: below this the photo has almost no measurable noise (heavy phone denoising, or a
+#     render), the ratio means nothing, and the check reports nothing rather than guess.
+# Known gaps: a paste from a photo with the same noise and no smoothing is not caught (measured: 0.1% at most
+# on sharp pastes); real portrait-mode blur or fog can raise a false flag. A flag only means manual review.
+NOISE_BLOCK = 16
+NOISE_LOW_RATIO = 0.4
+SMOOTH_REGION_MAX = 0.015
+NOISE_MIN_MEDIAN = 0.5
+
 REUSE_MAX_MAD = 4.5       # across jobs: catch edited copies; a false flag only means manual review
 NO_CHANGE_MAX_MAD = 2.0   # before vs after in one job: near-identity only, so small genuine repairs pass
 
@@ -172,7 +193,53 @@ def analyze(raw: bytes) -> dict:
         reasons.append(f"too dark (brightness {bright:.0f} < {MIN_BRIGHTNESS:.0f})")
     return {"width": w, "height": h, "sharpness": round(sharp, 1), "brightness": round(bright, 1),
             "quality_ok": not reasons, "quality_reasons": reasons, "phash": dhash(img), "thumb": thumb(img),
-            "exif": exif}
+            "exif": exif, "noise": noise_consistency(img)}
+
+
+def noise_consistency(img) -> dict:
+    """{"median": typical block noise, "smooth_region": share of the frame in the largest smooth area}."""
+    from PIL import ImageChops, ImageFilter
+    gray = img.convert("L")
+    if gray.width > 1024:  # downscaling averages noise evenly, so the ratios still hold
+        gray = gray.resize((1024, max(1, round(gray.height * 1024 / gray.width))))
+    diff = ImageChops.difference(gray, gray.filter(ImageFilter.MedianFilter(3)))
+    b = NOISE_BLOCK
+    cols, rows = gray.width // b, gray.height // b
+    if cols < 4 or rows < 4:
+        return {"median": None, "smooth_region": 0.0}
+    from PIL import Image
+    area = (0, 0, cols * b, rows * b)  # a BOX resize by exactly b is the mean of each b x b block
+    def cells(im) -> list[float]:
+        im = im.crop(area).resize((cols, rows), Image.BOX)
+        return list(getattr(im, "get_flattened_data", im.getdata)())
+    bright, noise = cells(gray), cells(diff.convert("F"))
+    # clipped blocks (a blown-out window, a black shadow) have no noise at all: leave them out
+    grid: list[list[Optional[float]]] = [
+        [None if not 10 <= bright[y * cols + x] <= 245 else noise[y * cols + x] for x in range(cols)]
+        for y in range(rows)]
+    vals = sorted(v for r in grid for v in r if v is not None)
+    if not vals:
+        return {"median": None, "smooth_region": 0.0}
+    med = vals[len(vals) // 2]
+    if med < NOISE_MIN_MEDIAN:
+        return {"median": round(med, 3), "smooth_region": 0.0}
+    low = {(y, x) for y in range(rows) for x in range(cols)
+           if grid[y][x] is not None and grid[y][x] < NOISE_LOW_RATIO * med}
+    best, seen = 0, set()
+    for start in low:
+        if start in seen:
+            continue
+        stack, n = [start], 0
+        seen.add(start)
+        while stack:
+            y, x = stack.pop()
+            n += 1
+            for nb in ((y + 1, x), (y - 1, x), (y, x + 1), (y, x - 1)):
+                if nb in low and nb not in seen:
+                    seen.add(nb)
+                    stack.append(nb)
+        best = max(best, n)
+    return {"median": round(med, 3), "smooth_region": round(best / (rows * cols), 4)}
 
 
 def phash_of_file(path: Path) -> Optional[str]:
@@ -333,6 +400,8 @@ def job_flags(evidence: list, authorized_at: Optional[str]) -> JobCheck:
         if sw and EDITORS.search(sw):
             block(f"edited_software:{e.id}")
     for a in after:
+        if ((a.quality or {}).get("noise") or {}).get("smooth_region", 0.0) >= SMOOTH_REGION_MAX:
+            block(f"pixel_inconsistency:{a.id}")
         for b in before:
             if same_photo(a.phash, b.phash, a.thumb, b.thumb, max_mad=NO_CHANGE_MAX_MAD):
                 block(f"after_matches_before:{a.id}")

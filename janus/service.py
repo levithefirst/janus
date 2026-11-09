@@ -429,7 +429,7 @@ class Janus:
                 normalize_image(raw)  # validates the type and size before any analysis
                 info = ev.analyze(raw)
                 item.quality = {k: info[k] for k in ("width", "height", "sharpness", "brightness")} | {
-                    "ok": info["quality_ok"], "reasons": info["quality_reasons"]}
+                    "ok": info["quality_ok"], "reasons": info["quality_reasons"], "noise": info["noise"]}
                 item.exif, item.phash, item.thumb = info["exif"], info["phash"], info["thumb"]
                 item.file, item.media_type, item.sha256 = self._ingest(t, raw, "evidence", item.id)
                 for hit in self.phash_index.add_and_match(t.id, item.id, item.phash, item.thumb):

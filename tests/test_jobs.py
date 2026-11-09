@@ -212,6 +212,28 @@ def test_camera_firmware_software_tag_is_not_an_edit(j):
     assert t.state == State.PACKET_READY
 
 
+def test_pasted_and_smoothed_area_flags_without_any_editor_tag(j):
+    """A pixel edit saved with camera EXIF and no Software tag: the noise check catches it, not the AI."""
+    from eval.scenes import paste_from
+    base = draw(ROOMS["sage"], "hole", False, seed=1)
+    donor = draw(ROOMS["blue"], "hole", True, seed=9, layout=900)
+    t = packet(j, job(j), a=jpeg(paste_from(base, donor), taken=clock.utcnow()))
+    assert t.state == State.MANUAL_REVIEW
+    assert any(f.startswith("pixel_inconsistency") for f in t.last_verdict.blocking_flags)
+    assert t.evidence[-1].quality["noise"]["smooth_region"] > 0.1
+
+
+def test_noise_check_ignores_genuine_photos_clipped_areas_and_noiseless_images():
+    from PIL import Image, ImageDraw
+    from janus.evidence import SMOOTH_REGION_MAX, noise_consistency
+    assert noise_consistency(draw(ROOMS["blue"], "shelf", True, seed=5))["smooth_region"] < SMOOTH_REGION_MAX
+    img = draw(ROOMS["sage"], "hole", True, seed=6)
+    ImageDraw.Draw(img).rectangle([100, 100, 400, 300], fill=(255, 255, 255))   # a blown-out window
+    assert noise_consistency(img)["smooth_region"] < SMOOTH_REGION_MAX
+    flat = noise_consistency(Image.new("RGB", (960, 720), (150, 150, 150)))       # no noise to compare
+    assert flat["smooth_region"] == 0.0
+
+
 def test_exif_time_flags(j):
     t = job(j)
     t = packet(j, t, a=after(taken=clock.utcnow() - timedelta(days=3)))

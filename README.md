@@ -129,7 +129,8 @@ time. It shows which defences fire; it is **not** a measurement of real-world er
 
 Result with the mock AI, as produced (`eval/results-mock.md`):
 
-- **False accepts: 1 of 9** bad cases (`edited-pasted`: a pixel edit with no editor tag; the mock cannot see it).
+- **False accepts: 0 of 9** bad cases. `edited-pasted` (a pixel edit with no editor tag) used to be the one false
+  accept; the deterministic noise-consistency check now sends it to manual review (`pixel_inconsistency`).
 - **False rejects: 1 of 4** good cases (`good-outlet`: the mock's change detector misses a small repair).
 - **Spurious reuse flags: 2** (before photos of different jobs in a similar-looking room).
 

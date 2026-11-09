@@ -125,6 +125,7 @@ FLAG_TEXT = {
     "after_matches_before": "The after photo looks the same as the before photo: no visible change.",
     "edited_software": "The photo file says it was saved by an editing app.",
     "likely_edited": "The AI sees signs that a photo was edited.",
+    "pixel_inconsistency": "Part of the after photo is much smoother than the rest, as if it was pasted or retouched.",
     "possible_edit": "The AI sees possible signs that a photo was edited.",
     "wrong_room": "The after photo does not look like the same place as the before photo.",
     "after_taken_before_authorization": "The after photo was taken before you approved the payment.",
