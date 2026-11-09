@@ -1,125 +1,188 @@
-import json
-
+"""The full loop against mock PayPal + mock AI: all three outcomes and the failure paths."""
 import pytest
 
-from conftest import EXAMPLES
-from eid.paypal import PayPalError
-from eid.service import EidError
-from eid.state import State, TransitionError
+from conftest import PHOTOS, authorized, new_threshold
+from janus.paypal import PayPalError
+from janus.service import JanusError
+from janus.state import State, TransitionError
 
 
-def evidence(name):
-    return json.loads((EXAMPLES / name).read_text())["items"]
+def mock_auth(j, t):
+    return j.paypal.get_authorization(t.id, t.payment.authorization_id)["status"]
 
 
-def to_authorized(eid, text):
-    job = eid.create_job(text)
-    assert job.state == State.CREATED
-    job = eid.create_payment(job.id)
-    assert job.state == State.PAYMENT_PENDING and job.payment.order_id
-    job = eid.authorize(job.id)
-    assert job.state == State.AUTHORIZED and job.payment.authorization_id
-    return job
+def test_create_compiles_condition(janus):
+    t = new_threshold(janus)
+    assert t.state == State.CREATED and t.amount == "24.00"
+    assert t.compiled.requirements and all(r.id.startswith("R") for r in t.compiled.requirements)
+    assert t.listing.photos == ["listing/L1.jpg"]
+    assert janus.get(t.id).compiled == t.compiled
 
 
-def test_job_card_from_text(eid, job_text):
-    job = eid.create_job(job_text)
-    assert job.amount == "180.00" and job.currency == "USD"
-    assert len(job.card.checklist) == 4
-    covered = {c for e in job.card.required_evidence for c in e.checklist_item_ids}
-    assert covered == {c.id for c in job.card.checklist}
-    assert eid.get(job.id).card == job.card  # persisted
+@pytest.mark.parametrize("bad", [dict(price="0"), dict(price="abc"), dict(condition=" "), dict(title="")])
+def test_create_validates(janus, bad):
+    args = dict(title="Mug", price="10", condition="Pay if it matches") | bad
+    with pytest.raises(JanusError):
+        janus.create(**args)
 
 
-def test_amount_required_when_text_has_no_price(eid):
-    with pytest.raises(EidError, match="no price"):
-        eid.create_job("Mow the lawn.")
-    assert eid.create_job("Mow the lawn.", amount="40").amount == "40.00"
+def test_match_captures(janus):
+    t = authorized(janus)
+    assert mock_auth(janus, t) == "CREATED"
+    t = janus.submit_and_verify(t.id, PHOTOS / "received_match.jpg", "here it is")
+    assert t.state == State.CAPTURED
+    assert t.last_verdict.verdict.verdict == "met" and t.last_verdict.action == "capture"
+    assert t.outcome.by == "janus" and t.payment.capture_id
+    assert mock_auth(janus, t) == "CAPTURED"
 
 
-def test_full_loop_approve_captures(eid, job_text):
-    job = to_authorized(eid, job_text)
-    job = eid.submit_evidence(job.id, evidence("evidence_complete.json"), EXAMPLES)
-    assert job.state == State.EVIDENCE_SUBMITTED and len(job.evidence) == 6
-    assert all(e.sha256 for e in job.evidence)
-    job = eid.generate_packet(job.id)
-    assert job.state == State.PACKET_READY
-    assert job.gap_report.recommended_action == "approve"
-    assert "# Acceptance packet" in job.packet_markdown
-    assert (eid.store.job_dir(job.id) / "acceptance_packet.md").is_file()
-    job = eid.approve(job.id)
-    assert job.state == State.CAPTURED and job.payment.capture_status == "COMPLETED"
-    actions = [e["action"] for e in job.events]
-    for a in ("order_created", "authorized", "gap_report_decision", "packet_generated", "captured"):
-        assert a in actions
-    log = (eid.config.data_dir / "eid.log.jsonl").read_text()
-    assert '"capture_authorization"' in log and '"job_card_decision"' in log
-
-
-def test_partial_evidence_then_dispute_voids(eid, job_text):
-    job = to_authorized(eid, job_text)
-    job = eid.submit_evidence(job.id, evidence("evidence_partial.json"), EXAMPLES)
-    job = eid.generate_packet(job.id)
-    assert job.gap_report.recommended_action == "request_more_evidence"
-    assert job.gap_report.gaps
-    job = eid.dispute(job.id, "Missing under-sink photo", kind="fix")
-    assert job.state == State.VOIDED and job.payment.voided
-    assert job.decision["decision"] == "fix"
+def test_mismatch_voids(janus):
+    t = authorized(janus)
+    t = janus.submit_and_verify(t.id, PHOTOS / "received_mismatch.jpg")
+    assert t.state == State.VOIDED and t.payment.voided and not t.payment.capture_id
+    assert t.last_verdict.action == "void"
+    assert mock_auth(janus, t) == "VOIDED"
     with pytest.raises(TransitionError):
-        eid.approve(job.id)  # can't capture a voided authorization
+        janus.release(t.id)  # can't capture a voided authorization
 
 
-def test_provider_can_add_evidence_after_gap_report(eid, job_text):
-    job = to_authorized(eid, job_text)
-    eid.submit_evidence(job.id, evidence("evidence_partial.json"), EXAMPLES)
-    eid.generate_packet(job.id)
-    job = eid.submit_evidence(job.id, evidence("evidence_complete.json"), EXAMPLES)
-    assert job.state == State.EVIDENCE_SUBMITTED
-    assert eid.generate_packet(job.id).gap_report.recommended_action == "approve"
+def test_unclear_holds_then_better_photo_captures(janus):
+    t = authorized(janus)
+    t = janus.submit_and_verify(t.id, PHOTOS / "received_unclear.jpg")
+    assert t.state == State.HELD and mock_auth(janus, t) == "CREATED"  # no money moved
+    assert t.last_verdict.verdict.next_step
+    with pytest.raises(TransitionError):
+        janus.verify(t.id)  # needs new evidence first
+    t = janus.submit_and_verify(t.id, PHOTOS / "received_match.jpg")
+    assert t.state == State.CAPTURED and len(t.verdicts) == 2
 
 
-@pytest.mark.parametrize("step", ["authorize", "evidence", "packet", "approve", "dispute"])
-def test_out_of_order_steps_are_rejected(eid, job_text, step):
-    job = eid.create_job(job_text)
-    calls = {
-        "authorize": lambda: eid.authorize(job.id),
-        "evidence": lambda: eid.submit_evidence(job.id, [{"note": "x"}]),
-        "packet": lambda: eid.generate_packet(job.id),
-        "approve": lambda: eid.approve(job.id),
-        "dispute": lambda: eid.dispute(job.id, "bad"),
-    }
+def test_held_buyer_can_release(janus):
+    t = authorized(janus)
+    janus.submit_and_verify(t.id, PHOTOS / "received_unclear.jpg")
+    t = janus.release(t.id)
+    assert t.state == State.CAPTURED and t.outcome.by == "buyer"
+
+
+def test_held_seller_can_refund(janus):
+    t = authorized(janus)
+    janus.submit_and_verify(t.id, PHOTOS / "received_unclear.jpg")
+    t = janus.refund(t.id)
+    assert t.state == State.VOIDED and t.outcome.by == "seller"
+
+
+def test_verdict_and_paypal_calls_logged(janus):
+    t = authorized(janus)
+    janus.submit_and_verify(t.id, PHOTOS / "received_match.jpg")
+    log = (janus.config.data_dir / "janus.log.jsonl").read_text()
+    for needle in ('"verdict"', '"capture"', '"condition_compiled"', '"get_authorization"'):
+        assert needle in log
+
+
+@pytest.mark.parametrize("step", ["authorize", "evidence", "verify", "release", "refund"])
+def test_out_of_order_rejected(janus, step):
+    t = new_threshold(janus)
+    calls = {"authorize": lambda: janus.authorize(t.id),
+             "evidence": lambda: janus.submit_evidence(t.id, note="x"),
+             "verify": lambda: janus.verify(t.id),
+             "release": lambda: janus.release(t.id),
+             "refund": lambda: janus.refund(t.id)}
     with pytest.raises(TransitionError):
         calls[step]()
-    assert eid.get(job.id).state == State.CREATED
+    assert janus.get(t.id).state == State.CREATED
 
 
-def test_approve_requires_packet(eid, job_text):
-    job = to_authorized(eid, job_text)
-    eid.submit_evidence(job.id, [{"note": "done"}])
-    with pytest.raises(TransitionError):
-        eid.approve(job.id)
+# ---------- idempotency ----------
+
+def test_payment_and_authorize_are_idempotent(janus):
+    t = new_threshold(janus)
+    o1 = janus.create_payment(t.id).payment.order_id
+    assert janus.create_payment(t.id).payment.order_id == o1
+    a1 = janus.authorize(t.id).payment.authorization_id
+    assert janus.authorize(t.id).payment.authorization_id == a1  # return URL hit twice
 
 
-def test_unknown_requirement_and_missing_file_rejected(eid, job_text):
-    job = to_authorized(eid, job_text)
-    with pytest.raises(EidError, match="unknown requirement_id"):
-        eid.submit_evidence(job.id, [{"requirement_id": "E99", "note": "x"}])
-    with pytest.raises(EidError, match="not found"):
-        eid.submit_evidence(job.id, [{"kind": "photo", "file": "nope.png"}])
-    assert eid.get(job.id).state == State.AUTHORIZED
+def test_authorize_adopts_existing_authorization(janus):
+    """Crash after PayPal authorized but before we saved: the next call adopts it, no double hold."""
+    t = new_threshold(janus)
+    janus.create_payment(t.id)
+    t = janus.get(t.id)
+    auth = janus.paypal.authorize_order(t.id, t.payment.order_id)  # happened, never recorded
+    t = janus.authorize(t.id)
+    assert t.state == State.AUTHORIZED and t.payment.authorization_id == auth["authorization_id"]
+    assert any(e["action"] == "authorization_adopted" for e in t.events)
 
 
-def test_failed_capture_can_be_retried(eid, job_text, monkeypatch):
-    job = to_authorized(eid, job_text)
-    eid.submit_evidence(job.id, evidence("evidence_complete.json"), EXAMPLES)
-    eid.generate_packet(job.id)
-    real = eid.paypal.capture_authorization
+def test_not_approved_yet(janus, monkeypatch):
+    t = new_threshold(janus)
+    janus.create_payment(t.id)
+    monkeypatch.setattr(janus.paypal, "get_order", lambda *a: {"status": "PAYER_ACTION_REQUIRED"})
+    with pytest.raises(JanusError, match="not approved"):
+        janus.authorize(t.id)
+    assert janus.get(t.id).state == State.PAYMENT_PENDING
 
-    def boom(*a, **k):
-        raise PayPalError("network down", 503)
-    monkeypatch.setattr(eid.paypal, "capture_authorization", boom)
+
+# ---------- expiry ----------
+
+def test_expired_authorization_is_never_captured(janus):
+    t = authorized(janus)
+    janus.paypal.expire(t.payment.authorization_id)
+    t = janus.submit_and_verify(t.id, PHOTOS / "received_match.jpg")
+    assert t.state == State.EXPIRED and not t.payment.capture_id and not t.verdicts
+    assert t.outcome.action == "expired"
+
+
+def test_refresh_and_sweep_detect_expiry(janus):
+    t = authorized(janus)
+    janus.paypal.expire(t.payment.authorization_id)
+    assert [x.state for x in janus.sweep()] == [State.EXPIRED]
+
+
+def test_capture_rejected_as_expired(janus, monkeypatch):
+    t = authorized(janus)
+    janus.submit_and_verify(t.id, PHOTOS / "received_unclear.jpg")
+    monkeypatch.setattr(janus.paypal, "capture_authorization", lambda *a: (_ for _ in ()).throw(
+        PayPalError("x", 422, body={"details": [{"issue": "AUTHORIZATION_EXPIRED"}]})))
+    assert janus.release(t.id).state == State.EXPIRED
+
+
+# ---------- failed captures ----------
+
+def test_retryable_capture_failure_then_retry(janus, monkeypatch):
+    t = authorized(janus)
+    real = janus.paypal.capture_authorization
+    monkeypatch.setattr(janus.paypal, "capture_authorization",
+                        lambda *a: (_ for _ in ()).throw(PayPalError("network down", None)))
     with pytest.raises(PayPalError):
-        eid.approve(job.id)
-    assert eid.get(job.id).state == State.APPROVED
-    monkeypatch.setattr(eid.paypal, "capture_authorization", real)
-    assert eid.approve(job.id).state == State.CAPTURED
+        janus.submit_and_verify(t.id, PHOTOS / "received_match.jpg")
+    t = janus.get(t.id)
+    assert t.state == State.CAPTURING and "network down" in t.payment.last_error
+    assert t.last_verdict.action == "capture"  # verdict kept; not re-run
+    monkeypatch.setattr(janus.paypal, "capture_authorization", real)
+    t = janus.retry_settlement(t.id)
+    assert t.state == State.CAPTURED and t.outcome.by == "janus" and t.payment.last_error is None
+
+
+def test_declined_capture_goes_to_hold(tmp_path):
+    from conftest import make_config
+    from janus.service import Janus
+    j = Janus(make_config(tmp_path, paypal_negative_test="capture=INSTRUMENT_DECLINED"))
+    t = authorized(j)
+    t = j.submit_and_verify(t.id, PHOTOS / "received_match.jpg")
+    assert t.state == State.HELD and "INSTRUMENT_DECLINED" in t.payment.last_error
+    assert j.paypal.get_authorization(t.id, t.payment.authorization_id)["status"] == "CREATED"
+    assert j.refund(t.id).state == State.VOIDED  # a human can still settle it
+
+
+def test_capture_reconciles_when_already_captured(janus):
+    t = authorized(janus)
+    janus.paypal.capture_authorization(t.id, t.payment.authorization_id)  # captured, never recorded
+    t = janus.submit_and_verify(t.id, PHOTOS / "received_match.jpg")
+    assert t.state == State.CAPTURED and t.payment.capture_id  # replayed, not double-captured
+
+
+def test_void_after_outside_capture_reports_captured(janus):
+    t = authorized(janus)
+    janus.paypal.capture_authorization(t.id, t.payment.authorization_id)
+    t = janus.submit_and_verify(t.id, PHOTOS / "received_mismatch.jpg")
+    assert t.state == State.CAPTURED and t.outcome.by == "paypal"

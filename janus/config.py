@@ -29,24 +29,29 @@ class Config:
     model: str
     data_dir: Path
     base_url: str
+    min_confidence: float = 0.85
+    # Sandbox negative testing, e.g. "capture=INSTRUMENT_DECLINED". Sent as PayPal-Mock-Response.
+    paypal_negative_test: str = ""
 
     @classmethod
     def from_env(cls) -> "Config":
         load_dotenv()
         env = os.environ.get
-        paypal_mode = env("EID_PAYPAL") or ("sandbox" if env("PAYPAL_CLIENT_ID") else "mock")
+        paypal_mode = env("JANUS_PAYPAL") or ("sandbox" if env("PAYPAL_CLIENT_ID") else "mock")
         has_key = env("ANTHROPIC_API_KEY") or env("ANTHROPIC_AUTH_TOKEN")
-        ai_mode = env("EID_AI") or ("claude" if has_key else "mock")
+        ai_mode = env("JANUS_AI") or ("claude" if has_key else "mock")
         if paypal_mode not in ("sandbox", "mock"):
-            raise ValueError(f"EID_PAYPAL must be 'sandbox' or 'mock', got {paypal_mode!r}")
+            raise ValueError(f"JANUS_PAYPAL must be 'sandbox' or 'mock', got {paypal_mode!r}")
         if ai_mode not in ("claude", "mock"):
-            raise ValueError(f"EID_AI must be 'claude' or 'mock', got {ai_mode!r}")
+            raise ValueError(f"JANUS_AI must be 'claude' or 'mock', got {ai_mode!r}")
         return cls(
             paypal_mode=paypal_mode,
             paypal_client_id=env("PAYPAL_CLIENT_ID", ""),
             paypal_client_secret=env("PAYPAL_CLIENT_SECRET", ""),
             ai_mode=ai_mode,
-            model=env("EID_MODEL", "claude-opus-5-5"),
-            data_dir=Path(env("EID_DATA_DIR", "./data")),
-            base_url=env("EID_BASE_URL", "http://localhost:8000").rstrip("/"),
+            model=env("JANUS_MODEL", "claude-opus-5-5"),
+            data_dir=Path(env("JANUS_DATA_DIR", "./data")),
+            base_url=env("JANUS_BASE_URL", "http://localhost:8000").rstrip("/"),
+            min_confidence=float(env("JANUS_MIN_CONFIDENCE", "0.85")),
+            paypal_negative_test=env("JANUS_PAYPAL_NEGATIVE_TEST", ""),
         )
