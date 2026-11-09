@@ -12,7 +12,9 @@ AUTH_VALIDITY = timedelta(days=AUTH_EXPIRY_DAYS)
 
 # Scheduler margins.
 WARN_BEFORE_HONOR = timedelta(hours=12)        # warn this long before the honor period ends
-VOID_BEFORE_EXPIRY = timedelta(hours=24)       # void this long before day 29, so we never hit expiry mid-capture
+# Void this long before day 29, so we never hit expiry mid-capture. 48 hours, not 24: on Vercel's Hobby plan the
+# scheduler runs once a day with up to an hour of jitter, so a 24-hour window could be missed entirely.
+VOID_BEFORE_EXPIRY = timedelta(hours=48)
 
 # Reauthorization.
 # Source: Payments v2 "Reauthorize authorized payment"

@@ -39,15 +39,27 @@ def test_timeline_warn_reauthorize_ask_void(setup):
     travel.advance(timedelta(days=3))                        # day 6: second honor period over
     assert acts(j) == ["new_authorization_requested"] and acts(j) == []
     assert j.get(t.id).payment.needs_new_authorization
-    travel.advance(timedelta(days=21, hours=23))             # just before day 28
+    travel.advance(timedelta(days=20, hours=23))             # just before day 27
     assert acts(j) == []
-    travel.advance(timedelta(hours=1))                       # day 28
+    travel.advance(timedelta(hours=1))                       # day 27: 48 h before expiry
     assert acts(j) == ["voided_before_expiry"]
     x = j.get(t.id)
     assert x.state == State.VOIDED and x.outcome.by == "scheduler" and not x.payment.captures
     kinds = [e["kind"] for e in j.audit.entries(t.id)]
     for k in ("honor_period_warning", "reauthorized", "new_authorization_needed", "void_requested", "voided"):
         assert k in kinds
+
+
+def test_a_daily_cron_always_lands_inside_the_void_window(setup):
+    """Ticks 25 hours apart (a daily cron plus jitter) still void before day 29."""
+    j, t, travel = setup
+    voided_at = None
+    for _ in range(40):
+        travel.advance(timedelta(hours=25))
+        if "voided_before_expiry" in acts(j):
+            voided_at = clock.utcnow()
+            break
+    assert voided_at is not None and voided_at < T0 + timedelta(days=29)
 
 
 def test_silent_customer_is_never_captured(setup):

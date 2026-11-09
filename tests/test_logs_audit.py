@@ -31,7 +31,7 @@ def test_audit_chain_and_tamper_detection(tmp_path):
     e = json.loads(lines[1]); e["reason"] = "edited"
     a.path.write_text("\n".join([lines[0], json.dumps(e), lines[2]]) + "\n")
     ok, msg = a.verify()
-    assert not ok and "line 2" in msg
+    assert not ok and "entry 2" in msg
 
 
 def test_audit_deletion_detected(tmp_path):

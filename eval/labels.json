@@ -1,0 +1,18 @@
+{
+  "about": "13 synthetic before/after job cases. Drawings, not photographs. Small: it shows whether each defence fires, it does not measure real-world error rates. 'clean' means the packet should be capturable without an override; 'flag' means it must not be.",
+  "cases": [
+    {"id": "good-hole",        "category": "good",       "expected": "clean", "what": "Wall hole patched; same room, small camera shift and lighting change"},
+    {"id": "good-shelf",       "category": "good",       "expected": "clean", "what": "Shelf mounted; same room"},
+    {"id": "good-outlet",      "category": "good",       "expected": "clean", "what": "Broken outlet replaced; same room"},
+    {"id": "good-no-exif",     "category": "good",       "expected": "clean", "what": "Wall hole patched; after photo has no EXIF (browser-resized upload)"},
+    {"id": "reused-cross-job", "category": "reused",     "expected": "flag",  "what": "After photo is a resized copy of good-hole's after photo"},
+    {"id": "reused-before",    "category": "reused",     "expected": "flag",  "what": "After photo is the before photo again"},
+    {"id": "reused-cropped",   "category": "reused",     "expected": "flag",  "what": "After photo is good-outlet's after photo, shrunk to 85%"},
+    {"id": "wrong-room-1",     "category": "wrong_room", "expected": "flag",  "what": "Before in the green room, after in the blue room"},
+    {"id": "wrong-room-2",     "category": "wrong_room", "expected": "flag",  "what": "Before in the yellow room, after in the terracotta room"},
+    {"id": "wrong-room-3",     "category": "wrong_room", "expected": "flag",  "what": "Before in the blue room, after in the green room"},
+    {"id": "edited-photoshop", "category": "edited",     "expected": "flag",  "what": "After photo saved by Adobe Photoshop (EXIF Software)"},
+    {"id": "edited-snapseed",  "category": "edited",     "expected": "flag",  "what": "After photo saved by Snapseed (EXIF Software)"},
+    {"id": "edited-pasted",    "category": "edited",     "expected": "flag",  "what": "Work area pasted from another room's photo; no editor tag in EXIF"}
+  ]
+}

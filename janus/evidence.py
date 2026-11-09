@@ -17,7 +17,6 @@ The result is a `Trust`: extra confidence needed on top of the base threshold, p
 """
 from __future__ import annotations
 
-import fcntl
 import io
 import json
 import math
@@ -70,7 +69,7 @@ def note_flags(note: str) -> list[str]:
 # ---------------- image analysis ----------------
 
 def _exif(img) -> dict:
-    out = {"present": False, "taken_at": None, "offset": None, "gps": None}
+    out = {"present": False, "taken_at": None, "offset": None, "gps": None, "software": None}
     try:
         ex = img.getexif()
     except Exception:
@@ -78,6 +77,9 @@ def _exif(img) -> dict:
     if not ex:
         return out
     out["present"] = True
+    sw = ex.get(305)  # Software: editors write their name here
+    if isinstance(sw, str) and sw.strip():
+        out["software"] = sw.strip()[:80]
     sub = ex.get_ifd(0x8769) or {}
     raw = sub.get(36867) or sub.get(36868) or ex.get(306)  # DateTimeOriginal, DateTimeDigitized, DateTime
     if isinstance(raw, str):
@@ -111,6 +113,41 @@ def hamming(a: str, b: str) -> int:
     return bin(int(a, 16) ^ int(b, 16)).count("1")
 
 
+THUMB = (32, 24)
+# Second-stage thresholds: mean absolute difference of mean-normalised 32x24 grey thumbnails (0-255).
+# Measured on the synthetic scenes (eval/scenes.py): true copies, resized to 70-95% or brightness +-10%,
+# reach 4.32; different photos whose 64-bit hashes collide go as low as 2.61. The ranges overlap, so the two
+# checks get different thresholds, chosen by what a mistake costs:
+REUSE_MAX_MAD = 4.5       # across jobs: catch edited copies; a false flag only means manual review
+NO_CHANGE_MAX_MAD = 2.0   # before vs after in one job: near-identity only, so small genuine repairs pass
+
+
+def thumb(img) -> str:
+    """A 32x24 greyscale thumbnail, hex encoded: the second check behind the 64-bit hash."""
+    return img.convert("L").resize(THUMB).tobytes().hex()
+
+
+def thumb_mad(a: str, b: str) -> float:
+    """Mean absolute difference after removing each thumbnail's mean (so a uniform brightness edit cancels)."""
+    x, y = bytes.fromhex(a), bytes.fromhex(b)
+    if len(x) != len(y) or not x:
+        return 255.0
+    mx, my = sum(x) / len(x), sum(y) / len(y)
+    return sum(abs((i - mx) - (j - my)) for i, j in zip(x, y)) / len(x)
+
+
+def same_photo(phash_a: Optional[str], phash_b: Optional[str], thumb_a: Optional[str] = None,
+               thumb_b: Optional[str] = None, max_mad: float = REUSE_MAX_MAD) -> bool:
+    """Two-stage near-duplicate test. A 64-bit hash alone collides for different photos of similar scenes
+    (two jobs in the same room, or before and after of a small repair), so when both thumbnails are known
+    they must also match closely, pixel for pixel."""
+    if not phash_a or not phash_b or hamming(phash_a, phash_b) > REUSE_MAX_DISTANCE:
+        return False
+    if thumb_a and thumb_b:
+        return thumb_mad(thumb_a, thumb_b) <= max_mad
+    return True
+
+
 def analyze(raw: bytes) -> dict:
     """Quality, perceptual hash and EXIF of the original upload. Pillow is required for evidence."""
     from PIL import Image, ImageFilter, ImageOps, ImageStat
@@ -134,7 +171,8 @@ def analyze(raw: bytes) -> dict:
     if bright < MIN_BRIGHTNESS:
         reasons.append(f"too dark (brightness {bright:.0f} < {MIN_BRIGHTNESS:.0f})")
     return {"width": w, "height": h, "sharpness": round(sharp, 1), "brightness": round(bright, 1),
-            "quality_ok": not reasons, "quality_reasons": reasons, "phash": dhash(img), "exif": exif}
+            "quality_ok": not reasons, "quality_reasons": reasons, "phash": dhash(img), "thumb": thumb(img),
+            "exif": exif}
 
 
 def phash_of_file(path: Path) -> Optional[str]:
@@ -145,32 +183,35 @@ def phash_of_file(path: Path) -> Optional[str]:
         return None
 
 
+def thumb_of_file(path: Path) -> Optional[str]:
+    try:
+        from PIL import Image
+        return thumb(Image.open(path).convert("RGB"))
+    except Exception:
+        return None
+
+
 # ---------------- cross-job reuse index ----------------
 
 class PhashIndex:
-    def __init__(self, data_dir: Path):
-        self.path = Path(data_dir) / "phash_index.jsonl"
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.touch(exist_ok=True)
+    STREAM = "phash_index"
 
-    def add_and_match(self, threshold_id: str, evidence_id: str, phash: str) -> list[dict]:
-        """Record this hash and return near-duplicates from OTHER jobs, atomically."""
-        with self.path.open("a+") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
-            try:
-                f.seek(0)
-                hits = []
-                for line in f:
-                    if line.strip():
-                        e = json.loads(line)
-                        if e["threshold_id"] != threshold_id and hamming(e["phash"], phash) <= REUSE_MAX_DISTANCE:
-                            hits.append(e)
-                f.seek(0, 2)
-                f.write(json.dumps({"threshold_id": threshold_id, "evidence_id": evidence_id, "phash": phash,
-                                    "at": iso()}) + "\n")
-                return hits
-            finally:
-                fcntl.flock(f, fcntl.LOCK_UN)
+    def __init__(self, store):
+        from .kv import Backend, FileBackend
+        self.kv = store if isinstance(store, Backend) else FileBackend(Path(store))
+
+    def entries(self) -> list[dict]:
+        return self.kv.stream(self.STREAM)
+
+    def add_and_match(self, threshold_id: str, evidence_id: str, phash: str,
+                      thumb_hex: Optional[str] = None) -> list[dict]:
+        """Record this photo and return near-duplicates from OTHER jobs, atomically."""
+        with self.kv.lock(f"index:{self.STREAM}"):
+            hits = [e for e in self.entries()
+                    if e["threshold_id"] != threshold_id and same_photo(e["phash"], phash, e.get("thumb"), thumb_hex)]
+            self.kv.append(self.STREAM, lambda last: {"threshold_id": threshold_id, "evidence_id": evidence_id,
+                                                      "phash": phash, "thumb": thumb_hex, "at": iso()})
+            return hits
 
 
 # ---------------- trust ----------------
@@ -252,3 +293,68 @@ def assess(evidence: list, authorized_at: Optional[str], delivery_location: Opti
         t.penalty += PENALTY_GPS
         t.flags.append("gps_inconsistent")
     return t
+
+
+# ---------------- job mode: before / after ----------------
+
+# Software tags that mean the file passed through an editor. Phone camera firmware also writes this tag
+# (e.g. "iOS 17.4", "G9910XXU2BWK1"), so only names of editing tools count.
+EDITORS = re.compile(r"photoshop|lightroom|gimp|affinity|pixelmator|snapseed|picsart|facetune|canva|"
+                     r"luminar|photopea|fotor|polarr|vsco|airbrush|retouch|remini|faceapp|meitu|pixlr", re.I)
+
+
+@dataclass
+class JobCheck:
+    blocking: list[str] = field(default_factory=list)   # capture needs a logged customer override
+    info: list[str] = field(default_factory=list)       # shown, and raise the confidence bar
+    penalty: float = 0.0
+
+
+def job_flags(evidence: list, authorized_at: Optional[str]) -> JobCheck:
+    """Integrity flags for a job's before and after photos. Deterministic: no AI involved."""
+    jc = JobCheck()
+    before = [e for e in evidence if e.phase == "before" and e.file]
+    after = [e for e in evidence if e.phase == "after" and e.file]
+
+    def block(flag: str) -> None:
+        if flag not in jc.blocking:
+            jc.blocking.append(flag)
+    if not before:
+        block("no_before_photo")
+    if not after:
+        block("no_after_photo")
+    for e in before + after:
+        for f in e.flags:
+            if f.startswith("reused_photo"):
+                block(f"reused_photo:{e.id}")
+            elif f == "instruction_like_note":
+                block(f"instruction_like_note:{e.id}")
+        sw = (e.exif or {}).get("software")
+        if sw and EDITORS.search(sw):
+            block(f"edited_software:{e.id}")
+    for a in after:
+        for b in before:
+            if same_photo(a.phash, b.phash, a.thumb, b.thumb, max_mad=NO_CHANGE_MAX_MAD):
+                block(f"after_matches_before:{a.id}")
+    auth = parse(authorized_at)
+    times = {}
+    for e in before + after:
+        taken, zone_known = exif_time_utc(e.exif or {})
+        if taken is not None:
+            times[e.id] = (taken, EXIF_SKEW_WITH_OFFSET if zone_known else EXIF_SKEW_NO_OFFSET)
+            if taken > utcnow() + times[e.id][1]:
+                block(f"taken_in_future:{e.id}")
+    for a in after:
+        if a.id in times and auth and times[a.id][0] < auth - times[a.id][1]:
+            block(f"after_taken_before_authorization:{a.id}")
+    b_times = [times[b.id] for b in before if b.id in times]
+    for a in after:
+        if a.id in times and b_times:
+            latest_before = max(t for t, _ in b_times)
+            if times[a.id][0] < latest_before - max(times[a.id][1], max(sk for _, sk in b_times)):
+                block(f"after_older_than_before:{a.id}")
+    for a in after:
+        if not (a.exif or {}).get("present"):
+            jc.info.append(f"no_exif:{a.id}")
+            jc.penalty = max(jc.penalty, PENALTY_NO_EXIF)
+    return jc

@@ -37,6 +37,11 @@ class Config:
     tenant_keys: str = ""         # "tenant:key,..." provider API keys (env only)
     admin_token: str = ""         # read-only operator access (env only)
     public_create: bool = True    # anyone may create thresholds in the "public" tenant (rate limited)
+    store: str = "file"           # file | sqlite | postgres  (see kv.py)
+    database_url: str = ""        # Postgres: DATABASE_URL_UNPOOLED preferred over DATABASE_URL (env only)
+    sqlite_path: str = ""
+    mount: str = ""               # URL prefix the app is served under, e.g. "/app" on Vercel
+    cron_secret: str = ""         # Vercel Cron sends "Authorization: Bearer <CRON_SECRET>" (env only)
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -64,4 +69,10 @@ class Config:
             tenant_keys=env("JANUS_TENANT_KEYS", ""),
             admin_token=env("JANUS_ADMIN_TOKEN", ""),
             public_create=env("JANUS_PUBLIC_CREATE", "1") == "1",
+            store=(env("JANUS_STORE") or ("postgres" if env("DATABASE_URL_UNPOOLED") or env("DATABASE_URL")
+                                          else "file")),
+            database_url=env("DATABASE_URL_UNPOOLED") or env("DATABASE_URL", ""),
+            sqlite_path=env("JANUS_SQLITE_PATH", ""),
+            mount=env("JANUS_MOUNT", "").rstrip("/"),
+            cron_secret=env("CRON_SECRET", ""),
         )

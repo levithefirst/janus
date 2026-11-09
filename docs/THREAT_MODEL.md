@@ -7,7 +7,7 @@ Scope: the `janus` backend on branch `hardening`. Every attack, its severity and
 
 | Term in the brief | Term in the code | Meaning |
 |---|---|---|
-| job | threshold (`th_...`) | one condition-governed payment |
+| job | threshold (`th_...`, `kind: job` or `kind: threshold`) | one held payment. In a job the provider uploads before/after photos and only the customer settles; in a threshold the AI may settle under the buyer's prior consent |
 | customer | buyer | the payer; authorizes on PayPal, consents, may release or dispute |
 | provider | seller | the payee; states the condition, may refund, may re-upload evidence |
 | checklist item | requirement (`R1`...) | one testable part of the compiled condition |
@@ -42,7 +42,7 @@ Scope: the `janus` backend on branch `hardening`. Every attack, its severity and
  provider / tenant API ────┤   janus server      │
  PayPal webhooks ──────────┤   (rules, policy,   ├──> Claude API              [untrusted output]
                            │    state machine)   │
- cron: janus tick ─────────┘         │           └──> local disk: data/       [trusted, may leak]
+ cron: janus tick ─────────┘         │           └──> storage: Postgres on Vercel, files locally  [trusted, may leak]
                                      v
                         audit.jsonl (hash chain), thresholds/<id>/threshold.json (CAS, flock)
 ```
@@ -77,7 +77,8 @@ Scope: the `janus` backend on branch `hardening`. Every attack, its severity and
 ## Assumptions
 
 - TLS terminates in front of the server (a reverse proxy). The server itself speaks HTTP.
-- `data/` is on a local POSIX filesystem (`flock` and `O_EXCL` semantics). Not NFS.
+- On Vercel, storage is Postgres through a direct (unpooled) connection, so session advisory locks hold across
+  serverless instances. Locally, `data/` is on a local POSIX filesystem (`flock` and `O_EXCL` semantics), not NFS.
 - One host, or several processes on one host. Rate limits are per process.
 - The host clock is NTP-synced. All times are UTC.
 - PayPal sandbox behaves as its documentation describes. Three behaviours are still unverified live:

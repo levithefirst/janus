@@ -252,21 +252,20 @@ class PayPalMock:
     mode = "mock"
 
     def __init__(self, data_dir: Path, negative_test: str = "", webhook_secret: str = "mock-webhook-secret"):
-        self.path = Path(data_dir) / "mock_paypal.json"
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        from .kv import Backend, FileBackend
+        self.kv = data_dir if isinstance(data_dir, Backend) else FileBackend(Path(data_dir))
         self.negative = _negative(negative_test)
         self.webhook_secret = webhook_secret
 
     def _db(self) -> dict:
-        db = json.loads(self.path.read_text()) if self.path.is_file() else {}
+        raw = self.kv.get("mock_paypal.json")
+        db = json.loads(raw) if raw else {}
         for k in ("orders", "auths", "captures", "requests"):
             db.setdefault(k, {})
         return db
 
     def _save(self, db: dict) -> None:
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(db, indent=2))
-        tmp.replace(self.path)
+        self.kv.put("mock_paypal.json", json.dumps(db, indent=2).encode())
 
     @staticmethod
     def _fail(code: str, status: int = 422):

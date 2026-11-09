@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Iterator, Optional, Union
 
 from . import rules
-from .ai import ClaudeAI, MockAI
+from .ai import AIError, ClaudeAI, MockAI
 from .audit import AuditLog
 from .config import Config
 from .logs import log_event, now, setup
@@ -28,7 +28,7 @@ from .constants import (AUTH_VALIDITY, HONOR_PERIOD, MAX_REAUTHORIZATIONS,
                         VOID_BEFORE_EXPIRY, WARN_BEFORE_HONOR)
 from .paypal import PayPalError, make_request_id, PayPalMock, PayPalSandbox, auth_from_order
 from .policy import Decision, decide, decide_items
-from .state import HOLDS_FUNDS, TERMINAL, State, TransitionError, check
+from .state import DECIDABLE, HOLDS_FUNDS, TERMINAL, State, TransitionError, check
 from .rules import RuleViolation
 from .security import Security, load_secret, parse_keys
 from .store import Amendment, Capture, Consent, Outcome, Pending, Store, Threshold, VerdictRecord
@@ -46,6 +46,10 @@ class JanusError(Exception):
 
 class StaleTermsError(JanusError):
     """The customer agreed to terms that are no longer the current terms."""
+
+
+class OverrideRequired(JanusError):
+    """The packet is flagged: capturing needs the customer's explicit override, with a reason."""
 
 
 def _money(amount: str) -> str:
@@ -95,18 +99,20 @@ class Janus:
     def __init__(self, config: Config, ai=None, paypal=None):
         self.config = config
         setup(config.data_dir)
-        self.store = Store(config.data_dir)
-        self.audit = AuditLog(config.data_dir)
+        from .kv import from_config
+        self.kv = from_config(config)
+        self.store = Store(self.kv, Path(config.data_dir) / "cache")
+        self.audit = AuditLog(self.kv)
         self.security = Security(load_secret(config.janus_secret, allow_ephemeral=config.paypal_mode == "mock"),
                                  parse_keys(config.tenant_keys), config.admin_token)
-        self.phash_index = ev.PhashIndex(config.data_dir)
+        self.phash_index = ev.PhashIndex(self.kv)
         from .webhooks import Inbox
-        self.inbox = Inbox(config.data_dir)
+        self.inbox = Inbox(self.kv)
         self.ai = ai or (ClaudeAI(config.model) if config.ai_mode == "claude" else MockAI())
         self.paypal = paypal or (
             PayPalSandbox(config.paypal_client_id, config.paypal_client_secret,
                           negative_test=config.paypal_negative_test)
-            if config.paypal_mode == "sandbox" else PayPalMock(config.data_dir, config.paypal_negative_test))
+            if config.paypal_mode == "sandbox" else PayPalMock(self.kv, config.paypal_negative_test))
 
     @classmethod
     def from_env(cls) -> "Janus":
@@ -116,9 +122,24 @@ class Janus:
 
     @contextmanager
     def _locked(self, tid: str) -> Iterator[Threshold]:
-        """Load-modify-save under the threshold's lock; saves are compare-and-set on top."""
-        with self.store.lock(tid):
+        """Load-modify-save under the threshold's lock; saves are compare-and-set on top. While it runs,
+        log records about this job (PayPal calls, AI, state changes) also go to the job's audit chain."""
+        with self.store.lock(tid), self._auditing():
             yield self.store.load(tid)
+
+    @contextmanager
+    def _auditing(self) -> Iterator[None]:
+        from .logs import audit_sink
+
+        def sink(rec: dict) -> None:
+            data = {k: v for k, v in rec.items() if k not in ("ts", "category", "action", "threshold_id")}
+            self.audit.append(f"{rec['category']}.{rec['action']}", rec["threshold_id"], rec["category"],
+                              rec["action"], fields=data)
+        token = audit_sink.set(sink)
+        try:
+            yield
+        finally:
+            audit_sink.reset(token)
 
     def _move(self, t: Threshold, target: State, **data) -> None:
         check(t.state, target)
@@ -136,9 +157,7 @@ class Janus:
     def _ingest(self, t: Threshold, image: ImageInput, subdir: str, stem: str) -> tuple[str, str, str]:
         raw = Path(image).read_bytes() if isinstance(image, (str, Path)) else image
         data, media_type, ext = normalize_image(raw)
-        d = self.store.dir(t.id) / subdir
-        d.mkdir(parents=True, exist_ok=True)
-        (d / f"{stem}{ext}").write_bytes(data)
+        self.store.put_file(t.id, f"{subdir}/{stem}{ext}", data)
         return f"{subdir}/{stem}{ext}", media_type, hashlib.sha256(data).hexdigest()
 
     def get(self, tid: str) -> Threshold:
@@ -178,7 +197,8 @@ class Janus:
         tid = self.store.new_id()
         draft = Threshold.model_construct(id=tid)
         listing.photos = [self._ingest(draft, p, "listing", f"L{i}")[0] for i, p in enumerate(photos or [], 1)]
-        compiled = self.ai.compile_condition(condition, listing, self.store.dir(tid), ref=tid)
+        with self._auditing():
+            compiled = self.ai.compile_condition(condition, listing, self.store.dir(tid), ref=tid)
         t = Threshold(id=tid, tenant=tenant, state=State.CREATED, created_at=now(),
                       updated_at=now(), listing=listing, condition=condition, compiled=compiled)
         self._record(t, "ai", "condition_compiled", requirements=[f"{r.id}{'*' if r.critical else ''}"
@@ -187,6 +207,26 @@ class Janus:
         self.store.save(t)
         self._audit(t, "condition_compiled", "seller", "seller stated the condition; AI compiled it",
                     requirements=[r.model_dump() for r in compiled.requirements], terms_hash=rules.terms_hash(t))
+        return t
+
+    def create_job(self, title: str, price: str, description: str, currency: str = "USD",
+                   tenant: str = "public") -> Threshold:
+        """Job mode: the provider describes the work; the AI writes the checklist the customer will judge."""
+        title, description = title.strip(), description.strip()
+        if not title:
+            raise JanusError("the job needs a title")
+        if not description:
+            raise JanusError("describe the work, so a checklist can be written")
+        listing = Listing(title=title, description=description, price=_money(price), currency=(currency or "USD").upper())
+        tid = self.store.new_id()
+        with self._auditing():
+            compiled = self.ai.compile_job(title, description, ref=tid)
+        t = Threshold(id=tid, tenant=tenant, kind="job", state=State.CREATED, created_at=now(), updated_at=now(),
+                      listing=listing, condition=description, compiled=compiled)
+        self.store.save(t)
+        self._audit(t, "job_created", "seller", "provider described the job; AI wrote the checklist",
+                    title=title, price=t.amount, checklist=[r.model_dump() for r in compiled.requirements],
+                    terms_hash=rules.terms_hash(t))
         return t
 
     # --- itemized pricing and scope amendments (provider proposes, customer consents) ---
@@ -275,7 +315,8 @@ class Janus:
                 self._audit(t, "consent_refused", "buyer", "the terms changed after the customer was shown them",
                             channel=channel)
                 raise StaleTermsError("the terms changed after you opened this page; reload it and read them again")
-            c = Consent(kind="auto_capture_on_verified", by="buyer", at=now(), terms_hash=rules.terms_hash(t),
+            c = Consent(kind="hold" if t.kind == "job" else "auto_capture_on_verified", by="buyer", at=now(),
+                        terms_hash=rules.terms_hash(t),
                         amount=t.amount, channel=channel, evidence_from=evidence_from or ["buyer"])
             t.consents.append(c)
             self._record(t, "state", "consent_recorded", kind=c.kind, channel=channel)
@@ -293,8 +334,8 @@ class Janus:
                 if not t.payment.order_id:
                     check(t.state, State.PAYMENT_PENDING)
                 return t
-            if not rules.valid_consent(t, ("auto_capture_on_verified", "amendment")):
-                raise JanusError("the customer must consent to the condition before paying")
+            if not rules.valid_consent(t, ("auto_capture_on_verified", "amendment", "hold")):
+                raise JanusError("the customer must consent to the terms before paying")
             base = self.config.base_url
             order = self.paypal.create_order(t.id, t.amount, t.currency, t.listing.title,
                                              return_url=f"{base}/paypal/return", cancel_url=f"{base}/",
@@ -336,7 +377,7 @@ class Janus:
     # --- 4: buyer submits evidence ---
 
     def submit_evidence(self, tid: str, photo: Optional[ImageInput] = None, note: str = "",
-                        by: str = "buyer") -> Threshold:
+                        by: str = "buyer", phase: Optional[str] = None) -> Threshold:
         """The customer (or, on re-upload, the provider) submits a photo. Integrity checks run on the
         original bytes before the photo is re-encoded."""
         if by not in ("buyer", "seller"):
@@ -344,35 +385,47 @@ class Janus:
         with self._locked(tid) as t:
             rules.check_not_terminal(t)
             in_dispute = t.state == State.DISPUTED
+            attach_only = in_dispute
+            if t.kind == "job":
+                if by != "seller" or phase not in ("before", "after"):
+                    raise JanusError("in a job the provider uploads photos, marked 'before' or 'after'")
+                if photo is None:
+                    raise JanusError("send a photo")
+                if t.state in (State.CAPTURING, State.VOIDING):
+                    raise TransitionError("a settlement is in progress")
+                attach_only = in_dispute or phase == "before"  # before photos never trigger a packet
+            elif phase is not None:
+                raise JanusError("before/after photos are for jobs")
             if in_dispute and by != "seller":
                 raise TransitionError("during a dispute only the provider adds evidence; withdraw the dispute first")
-            if not in_dispute:
+            if not attach_only:
                 check(t.state, State.EVIDENCE_SUBMITTED)
             clean = ev.sanitize_note(note)
             if photo is None and not clean:
                 raise JanusError("send a photo of the item")
             item = EvidenceItem(id=f"V{len(t.evidence) + 1}", by=by, note=clean, submitted_at=now(),
-                                flags=ev.note_flags(clean))
+                                flags=ev.note_flags(clean), phase=phase)
             if photo is not None:
                 raw = Path(photo).read_bytes() if isinstance(photo, (str, Path)) else photo
                 normalize_image(raw)  # validates the type and size before any analysis
                 info = ev.analyze(raw)
                 item.quality = {k: info[k] for k in ("width", "height", "sharpness", "brightness")} | {
                     "ok": info["quality_ok"], "reasons": info["quality_reasons"]}
-                item.exif, item.phash = info["exif"], info["phash"]
+                item.exif, item.phash, item.thumb = info["exif"], info["phash"], info["thumb"]
                 item.file, item.media_type, item.sha256 = self._ingest(t, raw, "evidence", item.id)
-                for hit in self.phash_index.add_and_match(t.id, item.id, item.phash):
+                for hit in self.phash_index.add_and_match(t.id, item.id, item.phash, item.thumb):
                     item.flags.append(f"reused_photo:{hit['threshold_id']}/{hit['evidence_id']}")
                 for lp in t.listing.photos:
-                    lh = ev.phash_of_file(self.store.dir(t.id) / lp)
-                    if lh and ev.hamming(lh, item.phash) <= ev.REUSE_MAX_DISTANCE:
+                    path = self.store.dir(t.id) / lp
+                    if ev.same_photo(ev.phash_of_file(path), item.phash, ev.thumb_of_file(path), item.thumb):
                         item.flags.append("matches_listing_photo")
             t.evidence.append(item)
             self._record(t, "state", "evidence_added", evidence_id=item.id, by=by, has_photo=bool(item.file),
                          flags=item.flags, quality_ok=item.quality.get("ok"))
-            self._audit(t, "evidence_added", by, f"evidence {item.id} submitted", evidence_id=item.id,
+            self._audit(t, "evidence_added", by, f"evidence {item.id} submitted" + (f" ({phase})" if phase else ""),
+                        evidence_id=item.id, phase=phase,
                         flags=item.flags, quality=item.quality, exif_present=bool(item.exif.get("present")))
-            if in_dispute:
+            if attach_only:
                 self.store.save(t)
             else:
                 self._move(t, State.EVIDENCE_SUBMITTED, total_evidence=len(t.evidence))
@@ -386,6 +439,8 @@ class Janus:
                 raise TransitionError(f"verify needs new evidence first (state is '{t.state.value}')")
             if self._expired_now(t):
                 return t
+            if t.kind == "job":
+                return self._verify_job(t)
             newest = next((e for e in reversed(t.evidence) if e.file), None)
             evidence_by = t.evidence[-1].by if t.evidence else "buyer"
             trust = ev.assess(t.evidence, t.payment.authorized_at, t.delivery_location)
@@ -462,6 +517,108 @@ class Janus:
         self._audit(t, "verdict", source, why, decision="hold", trust_flags=trust.flags)
         self._move(t, State.HELD, reason=f"{source}: {why}")
         return t
+
+    def _verify_job(self, t: Threshold) -> Threshold:
+        """Build the acceptance packet. It never moves money: it ends in packet_ready or manual_review."""
+        jc = ev.job_flags(t.evidence, t.payment.authorized_at)
+        blocking, info = list(jc.blocking), list(jc.info)
+        bar = round(min(ev.MAX_BAR, self.config.min_confidence + jc.penalty), 4)
+        after = [e for e in t.evidence if e.phase == "after" and e.file]
+        if after and not after[-1].quality.get("ok", True):
+            blocking.append("photo_quality:" + "; ".join(after[-1].quality.get("reasons", [])))
+        source = "ai"
+        try:
+            v = self.ai.verify_job(t.compiled, t.evidence, self.store.dir(t.id), ref=t.id)
+        except AIError as e:  # manual-review fallback: no AI packet, a person decides
+            source = "ai_unavailable"
+            blocking.append("no_ai_packet")
+            v = Verdict(verdict="uncertain", confidence=0.0, summary=f"No AI packet: {e}", next_step=None,
+                        checks=[RequirementCheck(requirement_id=r.id, result="cannot_tell", confidence=0.0,
+                                                 observation="not assessed: the AI was unavailable")
+                                for r in t.compiled.requirements])
+        if v.scene_match == "different":
+            blocking.append("wrong_room")
+        elif v.scene_match == "unclear":
+            info.append("scene_unclear")
+        if v.edit_signs == "likely":
+            blocking.append("likely_edited")
+        elif v.edit_signs == "possible":
+            blocking.append("possible_edit")
+        decision = decide(v, t.compiled, bar)
+        action = {"capture": "recommend_accept", "void": "recommend_reject"}.get(decision.action, "review")
+        target = State.MANUAL_REVIEW if blocking or action == "review" else State.PACKET_READY
+        reason = decision.reason if not blocking else "flagged: " + ", ".join(blocking)
+        t.verdicts.append(VerdictRecord(at=now(), evidence_ids=[e.id for e in t.evidence], verdict=v, action=action,
+                                        reason=reason, min_confidence=bar, evidence_by="seller", source=source,
+                                        trust_flags=info, blocking_flags=blocking))
+        self._audit(t, "packet", "janus", reason, verdict=v.verdict, confidence=v.confidence, min_confidence=bar,
+                    recommendation=action, blocking_flags=blocking, info_flags=info, source=source,
+                    scene_match=v.scene_match, edit_signs=v.edit_signs,
+                    checks={c.requirement_id: [c.result, c.confidence, c.observation] for c in v.checks})
+        self._move(t, target, reason=reason)
+        return t
+
+    # --- job mode: only the customer decides ---
+
+    def _require_decidable_job(self, t: Threshold) -> None:
+        if t.kind != "job":
+            raise JanusError("accept, partial and reject are for jobs; use release or refund")
+        rules.check_not_terminal(t)
+        if t.state not in DECIDABLE:
+            raise TransitionError(f"the customer cannot decide in state '{t.state.value}'")
+
+    def _override_if_flagged(self, t: Threshold, override_reason: str, channel: str) -> None:
+        rec = t.last_verdict
+        if not rec or not rec.blocking_flags:
+            return
+        if not (override_reason or "").strip():
+            raise OverrideRequired("this packet is flagged (" + ", ".join(rec.blocking_flags) + "). To pay anyway, "
+                                   "confirm the override and say why.")
+        c = Consent(kind="override", by="buyer", at=now(), terms_hash=rules.terms_hash(t), amount=t.amount,
+                    channel=channel, verdict_index=len(t.verdicts) - 1, reason=override_reason.strip()[:500])
+        t.consents.append(c)
+        self._audit(t, "override", "buyer", c.reason, overridden_flags=rec.blocking_flags,
+                    verdict_index=c.verdict_index, channel=channel)
+
+    def _remaining(self, t: Threshold) -> Decimal:
+        return Decimal(t.amount) - self._captured_total(t)
+
+    def accept(self, tid: str, override_reason: str = "", channel: str = "web") -> Threshold:
+        """The customer accepts the work: capture the full held amount."""
+        with self._locked(tid) as t:
+            self._require_decidable_job(t)
+            check(t.state, State.CAPTURING)
+            self._override_if_flagged(t, override_reason, channel)
+            t.consents.append(Consent(kind="release", by="buyer", at=now(), terms_hash=rules.terms_hash(t),
+                                      amount=str(self._remaining(t)), channel=channel))
+            self._audit(t, "customer_accepted", "buyer", "customer accepted the work", amount=str(self._remaining(t)),
+                        channel=channel)
+            return self._start(t, "capture", "buyer", "Customer accepted the work")
+
+    def partial(self, tid: str, amount: str, override_reason: str = "", channel: str = "web") -> Threshold:
+        """The customer accepts part of the work: capture `amount`, then void the rest of the hold."""
+        with self._locked(tid) as t:
+            self._require_decidable_job(t)
+            check(t.state, State.CAPTURING)
+            value = Decimal(_money(amount))
+            if value >= self._remaining(t):
+                raise JanusError(f"a partial amount must be less than the {self._remaining(t)} held; "
+                                 "to pay it all, accept instead")
+            self._override_if_flagged(t, override_reason, channel)
+            t.consents.append(Consent(kind="release", by="buyer", at=now(), terms_hash=rules.terms_hash(t),
+                                      amount=str(value), channel=channel))
+            self._audit(t, "customer_partial", "buyer", f"customer accepted {value} of {t.amount}; the rest is voided",
+                        amount=str(value), channel=channel)
+            return self._start(t, "capture", "buyer", f"Customer accepted part of the work ({value} {t.currency})",
+                               amount=str(value), final=False, then_void=True)
+
+    def reject(self, tid: str, reason: str = "", channel: str = "web") -> Threshold:
+        """The customer rejects the work: void the hold. Never needs an override."""
+        with self._locked(tid) as t:
+            self._require_decidable_job(t)
+            check(t.state, State.VOIDING)
+            self._audit(t, "customer_rejected", "buyer", reason[:500] or "customer rejected the work", channel=channel)
+            return self._start(t, "void", "buyer", reason[:500] or "Customer rejected the work")
 
     def submit_and_verify(self, tid: str, photo: Optional[ImageInput], note: str = "",
                           by: str = "buyer") -> Threshold:
@@ -652,6 +809,10 @@ class Janus:
         return False
 
     def _finish(self, t: Threshold, target: State, outcome: Outcome) -> Threshold:
+        if target == State.VOIDED and t.payment.captures and t.kind == "job":
+            captured = sum((Decimal(c.amount) for c in t.payment.captures), Decimal("0"))
+            outcome = Outcome(action="partial", by=outcome.by, at=outcome.at,
+                              reason=f"Captured {captured} of {t.amount} {t.currency}; the rest of the hold was voided.")
         t.outcome = outcome
         t.pending = None
         t.payment.last_error = None
@@ -665,7 +826,8 @@ class Janus:
         return sum((Decimal(c.amount) for c in t.payment.captures), Decimal("0"))
 
     def _start(self, t: Threshold, action: str, by: str, reason: str, amount: Optional[str] = None,
-               final: bool = True, items: tuple[str, ...] = (), verdict_index: Optional[int] = None) -> Threshold:
+               final: bool = True, items: tuple[str, ...] = (), verdict_index: Optional[int] = None,
+               then_void: bool = False) -> Threshold:
         """Write the exact settlement to disk (state + request id + amount), then execute it."""
         mid = State.CAPTURING if action == "capture" else State.VOIDING
         if action == "capture":
@@ -676,7 +838,7 @@ class Janus:
         else:
             rid = make_request_id(t.id, "void")
         t.pending = Pending(action=action, by=by, reason=reason, request_id=rid, amount=amount, final=final,
-                            items=list(items), verdict_index=verdict_index, at=now())
+                            items=list(items), verdict_index=verdict_index, then_void=then_void, at=now())
         t.outcome = Outcome(action=action, by=by, reason=reason, at=now())
         self._move(t, mid, by=by, request_id=rid)
         self._audit(t, f"{action}_requested", by, reason, request_id=rid, amount=amount, final=final,
@@ -708,6 +870,8 @@ class Janus:
         if action == "capture":
             try:
                 rules.check_capture(t, pend.by, self.config.min_confidence)
+                self._audit(t, "rule_check", "rules", "all hard rules passed before capture", result="pass",
+                            request_id=pend.request_id, amount=pend.amount, by=pend.by)
             except RuleViolation as v:
                 self._audit(t, "rule_blocked", pend.by, str(v), rule=v.rule, request_id=pend.request_id)
                 return self._hold(t, f"Blocked by rule {v.rule}: {v}", actor="rules")
@@ -736,6 +900,8 @@ class Janus:
                     return done(State.CAPTURED)
                 self._audit(t, "partial_capture", pend.by, pend.reason, capture_id=p.capture_id,
                             amount=pend.amount, items=pend.items)
+                if pend.then_void:  # partial acceptance: release the rest of the hold now
+                    return self._start(t, "void", pend.by, f"{pend.reason}; the rest of the hold is released")
                 return self._hold(t, "Partial capture done; remaining items still held", actor=pend.by)
             self.paypal.void_authorization(t.id, p.authorization_id, pend.request_id)
             p.voided, p.authorization_status = True, "VOIDED"

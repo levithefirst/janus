@@ -63,6 +63,13 @@ gate, and treats notes and image text as untrusted data in the prompt, with inje
 often strip EXIF, so the time and place checks are weak for browser uploads. A determined forger with a fresh,
 staged photo is not stopped by software alone.
 
+Job mode adds deterministic checks on the provider's before and after photos (reuse across jobs, after
+matching before, editor names in EXIF, inconsistent capture times) and asks the model whether before and after
+show the same place and whether a photo looks edited. Any flag sends the job to manual review, and the customer
+must override it, with a reason that is logged, to pay. On a 13-case synthetic eval with the mock AI: 1 false
+accept out of 9 bad cases (a pixel edit with no editor tag) and 1 false reject out of 4 good cases. Those are
+drawings, not real photos; real error rates: Unknown, not yet measured. See `eval/results-mock.md`.
+
 ## 8. What about refunds and disputes after the money is captured?
 
 PayPal's own rules still apply after capture. A merchant can refund within 180 days of payment. A US buyer can
@@ -75,7 +82,9 @@ Sources: [PayPal refunds](https://www.paypal.com/us/cshelp/article/how-do-i-issu
 
 ## 9. How does Janus handle partial work?
 
-Each checklist item can carry an amount. Janus captures only the items verified as met, leaves the rest held,
+In a job, the customer can pay part: they enter an amount, Janus captures it with final_capture false, then
+voids the rest of the hold, and a crash between the two finishes with the void. In threshold mode, each
+checklist item can carry an amount. Janus captures only the items verified as met, leaves the rest held,
 and never captures the same item twice. Gap: an itemized job cannot be amended yet. Sandbox check (2026-11-09):
 PayPal does allow voiding the remainder after a partial capture. On authorization 8TJ27215PX638500B ($10.00),
 a $4.00 capture with final_capture false left status PARTIALLY_CAPTURED (capture 0CX971222E3797614,

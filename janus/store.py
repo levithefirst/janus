@@ -1,13 +1,11 @@
 """JSON-file store: one file per threshold at <data_dir>/thresholds/<id>/threshold.json."""
 from __future__ import annotations
 
-import fcntl
-import os
+import json
 import secrets
-import threading
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import TYPE_CHECKING, Any, Iterator, Optional
 
 from pydantic import BaseModel, Field
 
@@ -15,16 +13,21 @@ from .logs import now
 from .models import CompiledCondition, EvidenceItem, Listing, Verdict
 from .state import TERMINAL, State
 
+if TYPE_CHECKING:
+    from .kv import Backend
+
 
 class Consent(BaseModel):
     """An explicit customer decision, bound to the exact terms it was given for."""
-    kind: str            # auto_capture_on_verified | release | amendment
+    kind: str            # auto_capture_on_verified | hold | release | amendment | override
     by: str              # always the customer (buyer); recorded for the audit trail
     at: str
     terms_hash: str
     amount: str
     channel: str         # web | api | cli
     evidence_from: list[str] = Field(default_factory=lambda: ["buyer"])  # whose evidence may auto-capture
+    verdict_index: Optional[int] = None   # override: the packet whose flags the customer overrode
+    reason: str = ""                      # override: the customer's stated reason
 
 
 class Capture(BaseModel):
@@ -46,6 +49,7 @@ class Pending(BaseModel):
     final: bool = True
     items: list[str] = Field(default_factory=list)
     verdict_index: Optional[int] = None   # which verdict justified an automatic capture
+    then_void: bool = False               # partial acceptance: void the rest once this capture lands
     at: str
 
 
@@ -87,8 +91,9 @@ class VerdictRecord(BaseModel):
     reason: str
     min_confidence: float = 0.85          # the bar this verdict had to clear (base + evidence trust penalty)
     evidence_by: str = "buyer"            # who submitted the evidence the verdict is about
-    source: str = "ai"                    # ai | quality_gate | integrity
+    source: str = "ai"                    # ai | quality_gate | integrity | ai_unavailable
     trust_flags: list[str] = Field(default_factory=list)
+    blocking_flags: list[str] = Field(default_factory=list)  # job mode: capture needs a logged customer override
 
 
 class Outcome(BaseModel):
@@ -102,6 +107,7 @@ class Threshold(BaseModel):
     id: str
     version: int = 0             # compare-and-set: bumped on every save
     tenant: str = "public"       # tokens are bound to it; a tenant key only reaches its own thresholds
+    kind: str = "threshold"      # threshold (AI may settle under consent) | job (only the customer decides)
     state: State
     created_at: str
     updated_at: str
@@ -147,64 +153,57 @@ class ImmutableError(Exception):
 
 
 class Store:
-    def __init__(self, data_dir: Path):
-        self.root = Path(data_dir) / "thresholds"
-        self.root.mkdir(parents=True, exist_ok=True)
-        self._guard = threading.Lock()
-        self._tlocks: dict[str, threading.Lock] = {}
+    """Thresholds as versioned documents, photos as blobs, on any storage backend (see kv.py)."""
+
+    def __init__(self, backend: "Backend", cache_dir: Optional[Path] = None):
+        self.kv = backend
+        self.cache_dir = Path(cache_dir or "/tmp/janus-cache")
 
     @staticmethod
     def new_id() -> str:
         return "th_" + secrets.token_hex(8)  # an identifier, not a credential: access needs a token
 
-    def dir(self, tid: str) -> Path:
-        return self.root / tid
+    @staticmethod
+    def _valid(tid: str) -> bool:
+        return bool(tid) and "/" not in tid and ".." not in tid and "\x00" not in tid
+
+    @staticmethod
+    def _key(tid: str) -> str:
+        return f"thresholds/{tid}/doc.json"
 
     @contextmanager
     def lock(self, tid: str) -> Iterator[None]:
-        """Exclusive lock on one threshold, across threads and processes (CLI, server, scheduler)."""
-        d = self.dir(tid)
-        if not d.is_dir() or "/" in tid or ".." in tid:
+        """Exclusive lock on one threshold, across threads, processes and (on Postgres) serverless instances."""
+        if not self._valid(tid) or self.kv.get_doc(self._key(tid))[1] is None:
             raise NotFound(tid)
-        with self._guard:
-            tl = self._tlocks.setdefault(tid, threading.Lock())
-        with tl, (d / ".lock").open("a") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(f, fcntl.LOCK_UN)
-
-    def _disk_version(self, tid: str) -> tuple[int, Optional[State]]:
-        p = self.dir(tid) / "threshold.json"
-        if not p.is_file():
-            return 0, None
-        raw = Threshold.model_validate_json(p.read_text())
-        return raw.version, raw.state
+        with self.kv.lock(f"threshold:{tid}"):
+            yield
 
     def save(self, t: Threshold) -> None:
-        """Compare-and-set write: fails if the file changed since `t` was loaded, or if it is terminal."""
-        disk_version, disk_state = self._disk_version(t.id)
-        if disk_state in TERMINAL:
-            raise ImmutableError(f"{t.id} is {disk_state.value}; terminal thresholds cannot change")
+        """Compare-and-set write: fails if the stored version moved since `t` was loaded, or if it is terminal."""
+        disk_version, raw = self.kv.get_doc(self._key(t.id))
+        if raw is not None:
+            disk_state = State(json.loads(raw)["state"])
+            if disk_state in TERMINAL:
+                raise ImmutableError(f"{t.id} is {disk_state.value}; terminal thresholds cannot change")
         if disk_version != t.version:
-            raise ConflictError(f"{t.id} changed on disk (version {disk_version}, expected {t.version})")
-        t.version += 1
-        t.updated_at = now()
-        d = self.dir(t.id)
-        d.mkdir(parents=True, exist_ok=True)
-        tmp = d / f"threshold.json.{os.getpid()}.{threading.get_ident()}.tmp"
-        tmp.write_text(t.model_dump_json(indent=2))
-        os.replace(tmp, d / "threshold.json")
+            raise ConflictError(f"{t.id} changed in storage (version {disk_version}, expected {t.version})")
+        old_version, old_updated = t.version, t.updated_at
+        t.version, t.updated_at = old_version + 1, now()
+        if not self.kv.cas_doc(self._key(t.id), old_version, t.model_dump_json(indent=2).encode()):
+            t.version, t.updated_at = old_version, old_updated
+            raise ConflictError(f"{t.id} changed in storage while saving (expected version {old_version})")
 
     def load(self, tid: str) -> Threshold:
-        p = self.dir(tid) / "threshold.json"
-        if not p.is_file() or "/" in tid or ".." in tid:
+        if not self._valid(tid):
             raise NotFound(tid)
-        return Threshold.model_validate_json(p.read_text())
+        _, raw = self.kv.get_doc(self._key(tid))
+        if raw is None:
+            raise NotFound(tid)
+        return Threshold.model_validate_json(raw)
 
     def all(self) -> list[Threshold]:
-        ts = [Threshold.model_validate_json(p.read_text()) for p in self.root.glob("*/threshold.json")]
+        ts = [Threshold.model_validate_json(raw) for raw in self.kv.docs("thresholds/")]
         return sorted(ts, key=lambda t: t.created_at)
 
     def find_by_order(self, order_id: str) -> Threshold:
@@ -212,3 +211,36 @@ class Store:
             if t.payment.order_id == order_id:
                 return t
         raise NotFound(f"no threshold for PayPal order {order_id}")
+
+    # --- photos ---
+
+    def put_file(self, tid: str, rel: str, data: bytes) -> None:
+        self.kv.put(f"thresholds/{tid}/{rel}", data)
+
+    def get_file(self, tid: str, rel: str) -> Optional[bytes]:
+        if not self._valid(tid):
+            return None
+        try:
+            return self.kv.get(f"thresholds/{tid}/{rel}")
+        except ValueError:
+            return None
+
+    def dir(self, tid: str) -> Path:
+        """A local folder holding this threshold's photos as files (the AI reads them from here).
+
+        On the file backend that is the storage itself. Elsewhere the blobs are copied into a local cache
+        first; the cache is only a read copy and is safe to lose.
+        """
+        local = self.kv.local_dir
+        if local is not None:
+            return local / "thresholds" / tid
+        d = self.cache_dir / tid
+        for key in self.kv.keys(f"thresholds/{tid}/"):
+            rel = key[len(f"thresholds/{tid}/"):]
+            if rel == "doc.json":
+                continue
+            target = d / rel
+            if not target.is_file():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(self.kv.get(key) or b"")
+        return d
