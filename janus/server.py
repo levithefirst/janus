@@ -4,7 +4,8 @@ Pages (phone-friendly):
 GET  /                        seller: describe the item and the condition -> buyer link + seller link
 GET  /t/{id}                  buyer link: authorize on PayPal, photograph the item, see the outcome
 GET  /t/{id}?k=SELLER_KEY     seller view of the same page (can refund while funds are held)
-GET  /t/{id}/pay              redirect to PayPal approval (creates the order once)
+GET  /t/{id}/pay              shows the terms (records nothing, safe for link previews)
+POST /t/{id}/pay              form: terms hash; records consent for those terms, then redirects to PayPal
 GET  /paypal/return?token=..  PayPal sends the buyer back here -> authorize -> /t/{id}
 
 JSON API:
@@ -35,9 +36,10 @@ from urllib.parse import parse_qs, quote, urlparse
 from . import clock
 from .ai import AIError
 from .logs import log_event
+from . import rules
 from .rules import RuleViolation
 from .paypal import PayPalError
-from .service import Janus, JanusError
+from .service import Janus, JanusError, StaleTermsError
 from .state import HOLDS_FUNDS, State, TransitionError
 from .security import RateLimiter
 from .store import NotFound, Threshold
@@ -235,7 +237,10 @@ on PayPal. Nothing is charged unless your condition is met.</p><div class="copy"
         else:
             parts.append(f"""<div class="banner b-info">Authorize {e(money)} with PayPal<p>PayPal holds the money.
 The seller is paid only if the item you receive meets the condition below; otherwise the hold is released
-and you are not charged.</p><a class="btn" href="/t/{t.id}/pay?t={quote(me)}">Authorize with PayPal</a></div>""")
+and you are not charged.</p><form method="post" action="/t/{t.id}/pay?t={quote(me)}"><input type="hidden" name="terms_hash"
+value="{e(rules.terms_hash(t))}"><p class="small muted">By tapping the button you agree that the seller is paid
+automatically when this condition is verified.</p><button class="btn" type="submit">Authorize with PayPal</button>
+</form></div>""")
             refresh = 0
     elif t.state == State.AUTHORIZED:
         parts.append(f'<div class="banner b-info">PayPal is holding {e(money)}<p>When the item arrives, '
@@ -417,6 +422,8 @@ def make_handler(j: Janus, limiter: Optional[RateLimiter] = None):
                 self._err(api, 404, "not found")
             except TransitionError as ex:
                 self._err(api, 409, str(ex))
+            except StaleTermsError as ex:
+                self._err(api, 409, str(ex))
             except (JanusError, RuleViolation) as ex:
                 self._err(api, 400, str(ex))
             except (PayPalError, AIError) as ex:
@@ -455,6 +462,8 @@ def make_handler(j: Janus, limiter: Optional[RateLimiter] = None):
                     raise JanusError("request too large")
                 status, out = handle(j, dict(self.headers.items()), self.rfile.read(n))
                 return self._send(status, out)
+            if len(parts) == 3 and parts[0] == "t" and parts[2] == "pay" and ID.fullmatch(parts[1]):
+                return self._post_pay(parts[1])
             b = self._body()
             cred = self._credential({}, b)
             if parts == ["api", "thresholds"]:
@@ -499,6 +508,25 @@ def make_handler(j: Janus, limiter: Optional[RateLimiter] = None):
                 return self._send(200, public(t))
             raise NotFound("route")
 
+        def _post_pay(self, tid: str):
+            """The buyer pressed "Authorize with PayPal": record consent for the terms they were shown, then PayPal."""
+            n = int(self.headers.get("Content-Length") or 0)
+            if n > 4096:
+                raise JanusError("request too large")
+            form = {k: v[0] for k, v in parse_qs(self.rfile.read(n).decode("utf-8", "replace")).items()}
+            cred = self._credential({k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()})
+            t, _ = self._need(tid, {BUYER}, cred)
+            if not form.get("terms_hash"):
+                raise JanusError("the terms are missing from the request; reload the page")
+            if t.state == State.CREATED:
+                t = j.consent(tid, channel="web", terms_hash=form["terms_hash"])
+            t = j.create_payment(tid)
+            if t.state != State.PAYMENT_PENDING or not t.payment.approve_url:
+                return self._redirect(j.buyer_link(t))
+            secure = "; Secure" if j.config.base_url.startswith("https") else ""
+            return self._redirect(t.payment.approve_url, cookie=f"janus_{tid}={cred}; Path=/paypal/return; "
+                                                                f"Max-Age=3600; HttpOnly; SameSite=Lax{secure}")
+
         def _get(self, parts, q):
             if not parts:
                 return self._send(200, landing(j), "text/html")
@@ -536,16 +564,9 @@ def make_handler(j: Janus, limiter: Optional[RateLimiter] = None):
                 if len(parts) == 2:
                     return self._send(200, threshold_page(j, self._view(tid), role == SELLER), "text/html")
                 if parts[2:] == ["pay"] and role == BUYER:
-                    # The buyer clicked "Authorize with PayPal" on a page that states the condition and
-                    # says the payment is captured automatically when it is verified: explicit consent.
-                    if t.state == State.CREATED:
-                        j.consent(tid, channel="web")
-                    t = j.create_payment(tid)
-                    if t.state != State.PAYMENT_PENDING or not t.payment.approve_url:
-                        return self._redirect(j.buyer_link(t))
-                    secure = "; Secure" if j.config.base_url.startswith("https") else ""
-                    return self._redirect(t.payment.approve_url, cookie=f"janus_{tid}={cred}; Path=/paypal/return; "
-                                                                        f"Max-Age=3600; HttpOnly; SameSite=Lax{secure}")
+                    # A GET only shows the terms. Link previews and prefetchers issue GETs, so a GET must never
+                    # record consent or create an order: that is the POST below.
+                    return self._redirect(j.buyer_link(t))
                 raise NotFound(tid)
             if parts[:2] == ["api", "t"] and len(parts) in (3, 4) and ID.fullmatch(parts[2]):
                 t, _ = self._need(parts[2], READ_ROLES, cred)

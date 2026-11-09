@@ -91,7 +91,8 @@ def test_evidence_submitter_comes_from_the_token_not_the_body(env):
 def test_paypal_return_without_cookie_reveals_nothing(env):
     j, call = env
     tid, bt, _ = create(call)
-    call("GET", f"/t/{tid}/pay?t={bt}")
+    from test_server import post_pay, shown_terms_hash
+    post_pay(call, tid, bt, shown_terms_hash(call, tid, bt))
     order = j.get(tid).payment.order_id
     status, html, h = call("GET", f"/paypal/return?token={order}")
     assert status == 200 and bt not in html and "Location" not in h   # authorized, but no link handed out

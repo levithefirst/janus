@@ -44,6 +44,10 @@ class JanusError(Exception):
     pass
 
 
+class StaleTermsError(JanusError):
+    """The customer agreed to terms that are no longer the current terms."""
+
+
 def _money(amount: str) -> str:
     try:
         d = Decimal(str(amount).replace("$", "").strip()).quantize(Decimal("0.01"))
@@ -258,10 +262,19 @@ class Janus:
 
     # --- explicit customer consent ---
 
-    def consent(self, tid: str, channel: str = "web", evidence_from: Optional[list[str]] = None) -> Threshold:
-        """The customer agrees, for the current terms, that a verified condition may capture automatically."""
+    def consent(self, tid: str, channel: str = "web", evidence_from: Optional[list[str]] = None,
+                terms_hash: Optional[str] = None) -> Threshold:
+        """The customer agrees, for the current terms, that a verified condition may capture automatically.
+
+        `terms_hash` is the hash of the terms the customer was shown. If it is given and no longer matches
+        the current terms (the provider changed them in between), nothing is recorded.
+        """
         with self._locked(tid) as t:
             rules.check_not_terminal(t)
+            if terms_hash is not None and terms_hash != rules.terms_hash(t):
+                self._audit(t, "consent_refused", "buyer", "the terms changed after the customer was shown them",
+                            channel=channel)
+                raise StaleTermsError("the terms changed after you opened this page; reload it and read them again")
             c = Consent(kind="auto_capture_on_verified", by="buyer", at=now(), terms_hash=rules.terms_hash(t),
                         amount=t.amount, channel=channel, evidence_from=evidence_from or ["buyer"])
             t.consents.append(c)
