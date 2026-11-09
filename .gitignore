@@ -73,3 +73,7 @@ Thumbs.db
 # Eid runtime data
 data/
 logs/
+
+# Sandbox measurement output (scripts/measure_sandbox.py)
+measurements.jsonl
+measurements.state.json
