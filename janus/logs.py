@@ -8,7 +8,6 @@ from __future__ import annotations
 import json
 import logging
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 
 logger = logging.getLogger("janus")
@@ -27,7 +26,8 @@ def setup(data_dir: Path, level: int = logging.INFO) -> None:
 
 
 def now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    from .clock import iso
+    return iso()
 
 
 def log_event(category: str, action: str, ref: str | None = None, **data) -> dict:

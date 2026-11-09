@@ -12,17 +12,16 @@ import json
 import secrets
 import time
 import uuid
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
 import requests
 
+from .clock import iso, utcnow
+from .constants import AUTH_VALIDITY
 from .logs import log_event
 
 SANDBOX_API = "https://api-m.sandbox.paypal.com"
-HONOR_PERIOD = timedelta(days=3)       # PayPal guarantees funds for 3 days
-AUTH_VALIDITY = timedelta(days=29)     # an authorization can be captured for up to 29 days
 
 
 class PayPalError(Exception):
@@ -254,7 +253,7 @@ class PayPalMock:
         if order["status"] != "APPROVED":
             self._fail("ORDER_NOT_APPROVED")
         auth_id = "MOCKAUTH-" + uuid.uuid4().hex[:10].upper()
-        exp = (datetime.now(timezone.utc) + AUTH_VALIDITY).isoformat(timespec="seconds")
+        exp = iso(utcnow() + AUTH_VALIDITY)
         order["status"], order["auth_id"] = "COMPLETED", auth_id
         db["auths"][auth_id] = {"id": auth_id, "status": "CREATED", "order_id": order_id,
                                 "amount": order["amount"], "expiration_time": exp, "capture_id": None}
@@ -266,7 +265,7 @@ class PayPalMock:
         a = db["auths"].get(authorization_id)
         if not a:
             self._fail("RESOURCE_NOT_FOUND", 404)
-        if a["status"] == "CREATED" and a["expiration_time"] < datetime.now(timezone.utc).isoformat():
+        if a["status"] == "CREATED" and a["expiration_time"] < iso():
             a["status"] = "EXPIRED"
         return a
 

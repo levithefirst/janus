@@ -13,7 +13,6 @@ import hashlib
 import io
 import threading
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Iterator, Optional, Union
@@ -22,7 +21,9 @@ from .ai import ClaudeAI, MockAI
 from .config import Config
 from .logs import log_event, now, setup
 from .models import EvidenceItem, Listing
-from .paypal import AUTH_VALIDITY, HONOR_PERIOD, PayPalError, PayPalMock, PayPalSandbox, auth_from_order
+from .clock import iso, parse, utcnow
+from .constants import AUTH_VALIDITY, HONOR_PERIOD
+from .paypal import PayPalError, PayPalMock, PayPalSandbox, auth_from_order
 from .policy import decide
 from .state import HOLDS_FUNDS, TERMINAL, State, TransitionError, check
 from .store import Outcome, Store, Threshold, VerdictRecord
@@ -47,13 +48,8 @@ def _money(amount: str) -> str:
     return str(d)
 
 
-def _parse_ts(s: Optional[str]) -> Optional[datetime]:
-    if not s:
-        return None
-    try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00"))
-    except ValueError:
-        return None
+def _parse_ts(s: Optional[str]):
+    return parse(s)
 
 
 def normalize_image(data: bytes) -> tuple[bytes, str, str]:
@@ -140,7 +136,7 @@ class Janus:
     @staticmethod
     def honor_period_over(t: Threshold) -> bool:
         at = _parse_ts(t.payment.authorized_at)
-        return bool(at) and datetime.now(timezone.utc) > at + HONOR_PERIOD
+        return bool(at) and utcnow() > at + HONOR_PERIOD
 
     # --- 1 + 2: seller states the condition, AI compiles it ---
 
@@ -200,8 +196,7 @@ class Janus:
             p = t.payment
             p.authorization_id, p.authorization_status = auth["authorization_id"], auth["status"]
             p.authorized_at = now()
-            p.expiration_time = auth.get("expiration_time") or (
-                datetime.now(timezone.utc) + AUTH_VALIDITY).isoformat(timespec="seconds")
+            p.expiration_time = auth.get("expiration_time") or iso(utcnow() + AUTH_VALIDITY)
             self._record(t, "paypal", "authorized", authorization_id=p.authorization_id,
                          status=p.authorization_status, expiration_time=p.expiration_time)
             self._move(t, State.AUTHORIZED)
@@ -295,7 +290,7 @@ class Janus:
             self.store.save(t)
             raise
         exp = _parse_ts(t.payment.expiration_time)
-        if status == "EXPIRED" or (status == "CREATED" and exp and exp < datetime.now(timezone.utc)):
+        if status == "EXPIRED" or (status == "CREATED" and exp and exp < utcnow()):
             self._finish(t, State.EXPIRED, Outcome(action="expired", by="paypal", at=now(),
                          reason="The PayPal authorization expired before the condition was settled. "
                                 "No money moved; the buyer must pay again."))

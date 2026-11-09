@@ -26,11 +26,12 @@ import binascii
 import html
 import json
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse
 
+from . import clock
 from .ai import AIError
 from .paypal import PayPalError
 from .service import Janus, JanusError
@@ -371,8 +372,8 @@ def make_handler(j: Janus):
         def _view(self, tid: str) -> Threshold:
             t = j.get(tid)
             if t.state in HOLDS_FUNDS and t.state not in (State.CAPTURING, State.VOIDING):
-                last = t.payment.checked_at and datetime.fromisoformat(t.payment.checked_at)
-                if not last or datetime.now(timezone.utc) - last > timedelta(seconds=60):
+                last = clock.parse(t.payment.checked_at)
+                if not last or clock.utcnow() - last > timedelta(seconds=60):
                     try:  # keep the page honest about expiry; a PayPal hiccup shouldn't break the page
                         t = j.refresh(tid)
                     except PayPalError:

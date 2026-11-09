@@ -10,10 +10,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
+from .constants import DEFAULT_MIN_CONFIDENCE
 from .models import CompiledCondition, Verdict
 
 Action = Literal["capture", "void", "hold"]
-DEFAULT_MIN_CONFIDENCE = 0.85
 
 
 @dataclass(frozen=True)
