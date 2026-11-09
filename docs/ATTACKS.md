@@ -12,17 +12,17 @@ Open (not addressed yet), Accepted (a deliberate trade-off, explained).
 
 | Status | Count |
 |---|---|
-| Mitigated | 33 |
+| Mitigated | 35 |
 | Partial | 8 |
 | Open | 3 |
 | Accepted | 3 |
-| **Total** | **47** |
+| **Total** | **49** |
 
 ## Money movement
 
 | # | Attack | Sev | Status | Control | Proof |
 |---|---|---|---|---|---|
-| M1 | Capture without the customer's consent (provider, bug, or insider triggers it) | Critical | Mitigated | `rules.check_capture` requires a consent bound to a hash of the current terms, or an explicit customer release; checked right before PayPal is called | `test_rules.py::test_check_capture_without_any_consent`, `test_capture_blocked_when_consent_is_for_other_terms`, `test_no_payment_without_consent` |
+| M1 | Capture without the customer's consent (provider, bug, or insider triggers it) | Critical | Mitigated | `rules.check_capture` requires a consent bound to a hash of the current terms, or an explicit customer release; checked right before PayPal is called. Consent is only ever recorded by a deliberate POST (see M15) | `test_rules.py::test_check_capture_without_any_consent`, `test_capture_blocked_when_consent_is_for_other_terms`, `test_no_payment_without_consent`, `test_server.py::test_post_pay_records_consent_bound_to_terms` |
 | M2 | Auto-settle on a low-confidence verdict | Critical | Mitigated | Policy holds below the bar; the rules re-check the bar independently, even if the policy is broken | `test_rules.py::test_below_threshold_always_holds`, `test_low_confidence_holds_even_if_policy_is_broken`, `test_threshold_edge_is_inclusive` |
 | M3 | Capture after a void or an expiry | Critical | Mitigated | Rule 3 checks the void/expiry flag, PayPal status and the expiration time; the state machine has no edge out of voided/expired | `test_rules.py::test_no_capture_after_void`, `test_no_capture_after_expiry`, `test_no_capture_past_expiration_time_even_if_paypal_status_lags` |
 | M4 | Change a job after it reached a terminal state | High | Mitigated | `Store.save` refuses any write once the stored state is terminal; every operation rejects terminal jobs | `test_atomic.py::test_terminal_threshold_cannot_be_saved`, `test_rules.py::test_terminal_threshold_rejects_every_operation` |
@@ -33,9 +33,11 @@ Open (not addressed yet), Accepted (a deliberate trade-off, explained).
 | M9 | Bait and switch: the provider changes scope after the customer agreed | High | Mitigated | Amendments need a new customer consent; a pending amendment blocks auto-capture; never above the authorized amount | `test_product.py::test_pending_amendment_blocks_auto_capture`, `test_amendment_cannot_exceed_authorized_amount` |
 | M10 | Provider forces a capture with their own evidence | High | Mitigated | Provider evidence never auto-captures unless the customer's consent names it | `test_product.py::test_provider_evidence_never_auto_captures_without_customer` |
 | M11 | Customer forces a void by photographing a different item | High | Accepted | A void returns the customer's own money, so the system is biased toward it by design. Reuse, listing-copy and capture-time checks raise the bar; the provider can dispute and re-upload. A product decision, not a bug | `test_evidence.py` (reuse, EXIF), `test_product.py::test_dispute_*` |
-| M12 | Authorization expires before the condition is settled (money stuck or capture fails) | Medium | Partial | Scheduler: warn before day 3, reauthorize once, void before day 29. Gap: the "ask the customer for a new authorization" step sets a flag and an alert, but there is no re-payment flow yet | `test_scheduler.py::test_timeline_warn_reauthorize_ask_void` |
+| M12 | Authorization expires before the condition is settled (money stuck or capture fails) | Medium | Partial | Scheduler: warn before day 3, reauthorize up to `MAX_REAUTHORIZATIONS` (1) times, void before day 29. A second reauthorization is refused without calling PayPal and raises a high severity `new_authorization_needed` alert. Gap: the "ask the customer for a new authorization" step sets a flag and an alert, but there is no re-payment flow yet | `test_scheduler.py::test_timeline_warn_reauthorize_ask_void`, `test_second_reauthorization_is_refused_and_flagged` |
 | M13 | Capture rejected by PayPal (declined instrument) leaves the job in limbo | Medium | Mitigated | Non-retryable rejection goes to HOLD with the reason; retryable errors stay pending and are retried with the same key | `test_flow.py::test_declined_capture_goes_to_hold`, `test_retryable_capture_failure_then_retry` |
-| M14 | PayPal behaves differently from the mock (void after partial capture; reauthorize limits; how long a request id is honoured) | Medium | Open | Marked `TODO(sandbox)` in the mock and as TODO constants in `constants.py`. Needs a live sandbox run | |
+| M14 | PayPal behaves differently from the mock (void after partial capture; reauthorize limits; how long a request id is honoured) | Medium | Open | Marked `TODO(sandbox)` in the mock and in `constants.py`. The reauthorization count is the single constant `MAX_REAUTHORIZATIONS = 1` because PayPal's docs conflict (multiple vs only once). Needs a live sandbox run | |
+| M15 | Consent recorded by a GET: a link previewer, prefetcher, crawler or antivirus link scanner opens the buyer link and consents for the buyer | High | Mitigated | `GET /t/<id>/pay` only redirects to the page that shows the terms and records nothing. The Authorize button is a form POST carrying the hash of the terms shown; the server records consent for exactly those terms, then redirects to PayPal and sets the HttpOnly return cookie. A POST with stale terms is refused (409) and audited as `consent_refused` | `test_server.py::test_get_pay_records_nothing`, `test_post_pay_records_consent_bound_to_terms`, `test_post_pay_with_stale_terms_is_rejected` |
+| M16 | Capture request with an amount of zero or less (itemized job with nothing pending) | Medium | Mitigated | `release()` refuses (or audits a no-op when every item is already captured) before recording consent; `_start` refuses a non-positive amount; `_settle` holds one instead of sending it. PayPal is never called | `test_product.py::test_release_with_nothing_pending_is_refused_without_calling_paypal`, `test_release_when_every_item_is_captured_is_an_audited_noop`, `test_capture_amount_zero_or_negative_never_reaches_paypal` |
 
 ## Webhooks
 
@@ -74,7 +76,7 @@ Open (not addressed yet), Accepted (a deliberate trade-off, explained).
 | S6 | Hotlink or share evidence photos | Medium | Mitigated | Photo URLs are HMAC-signed per file and expire after 5 minutes | `test_security.py::test_photo_urls_are_signed_and_expire`, `test_unsigned_photo_url_is_refused` |
 | S7 | Path traversal through file routes | High | Mitigated | Signed path check, then resolved path must stay inside the job's folder | `test_server.py::test_rejects_bad_input` |
 | S8 | XSS through listing text, condition or notes | High | Mitigated | `html.escape` on all output; packet Markdown escaped | `test_security.py::test_submitter_text_is_escaped_in_pages`, `test_packet.py` |
-| S9 | CSRF | Medium | Mitigated | State-changing API calls need the token in a custom header, which a cross-site form cannot send. The only cookie is scoped to the idempotent PayPal return path | design |
+| S9 | CSRF | Medium | Mitigated | State-changing API calls need the token in a custom header, which a cross-site form cannot send. The consent form POST (`/t/<id>/pay`) carries the buyer token in its URL, not in an ambient cookie, so a cross-site form cannot submit it. The only cookie is scoped to the idempotent PayPal return path | design, `test_server.py::test_post_pay_needs_terms_and_the_buyer_token` |
 | S10 | Denial of service or AI-cost abuse | Medium | Partial | Per-IP token buckets (tighter on AI routes), 429 with Retry-After. Gap: in-memory per process, no global spend cap, public create on by default (`JANUS_PUBLIC_CREATE=0` turns it off) | `test_security.py::test_rate_limit_returns_429`, `test_public_create_can_be_turned_off` |
 | S11 | PII in logs (notes, emails, phones, GPS) | Medium | Mitigated | Redaction of sensitive keys and patterns on every log and audit write; GPS rounded and never logged | `test_logs_audit.py::test_redacts_pii_and_secrets`, `test_evidence.py::test_gps_is_rounded_and_never_logged` |
 | S12 | Secrets committed or written to disk | High | Mitigated | Secrets only from the environment; tokens derived, never stored; `.env` gitignored; weak secrets refused | `test_security.py::test_no_secret_or_token_is_written_to_disk`, `test_weak_secrets_and_keys_are_refused` |
