@@ -100,15 +100,21 @@ async function decide(kind){const body={override_reason:overrideReason()};
     body.reason=(document.getElementById('why')||{}).value||''}
   if(kind==='accept'&&!confirm('Pay the full amount to the provider?'))return;
   await act('/api/t/'+JID+'/'+kind,body,'Telling PayPal…','err-decide')}
-let seen=0,state=document.body.dataset.state;
+let seen=0,state=document.body.dataset.state,leaving=false;
+// A form submit or navigation in flight must never be cancelled by the live refresh below: the first tap on the
+// approve button saves the order a moment before the redirect to PayPal reaches the browser.
+document.addEventListener('submit',e=>{leaving=true;const b=e.target.querySelector('button[type=submit]');
+  if(b){b.disabled=true;b.textContent='Opening PayPal…'}});
+addEventListener('pagehide',()=>{leaving=true});
+addEventListener('pageshow',e=>{if(e.persisted){leaving=false;document.querySelectorAll('form button[type=submit]').forEach(b=>{b.disabled=false})}});
 function row(x){const li=document.createElement('li');const s=document.createElement('b');s.textContent=x.seq;
   const t=document.createElement('span');t.textContent=x.ts.slice(11,19)+'  '+x.kind+'  ('+x.actor+')  '+(x.reason||'');
   const h=document.createElement('span');h.className='h';h.textContent='prev '+x.prev.slice(0,12)+'…  hash '+x.hash.slice(0,12)+'…';
   li.append(s,t,h);return li}
-async function poll(){if(!JID||!TK)return;try{const d=await api('/api/t/'+JID+'/audit?after='+seen);const ol=document.getElementById('audit');
+async function poll(){if(!JID||!TK||leaving)return;try{const d=await api('/api/t/'+JID+'/audit?after='+seen);const ol=document.getElementById('audit');
   if(ol){d.entries.forEach(x=>ol.prepend(row(x)))}seen=d.count;const v=document.getElementById('chain');
   if(v)v.textContent=(d.verified?'Chain intact':'CHAIN BROKEN')+' · '+d.count+' entries · head '+(d.head||'').slice(0,16)+'…';
-  const s=await api('/api/t/'+JID);if(s.state!==state){location.reload()}}catch(e){}}
+  if(leaving)return;const s=await api('/api/t/'+JID);if(s.state!==state&&!leaving){location.reload()}}catch(e){}}
 async function verifyChain(){try{const v=await api('/api/t/'+JID+'/audit/verify');
   document.getElementById('chain').textContent=(v.verified?'Verified: ':'FAILED: ')+v.message+' · head '+(v.head||'').slice(0,16)+'…'}catch(e){fail(e)}}
 if(JID&&TK){poll();setInterval(poll,4000)}

@@ -552,8 +552,10 @@ def make_handler(j: Janus, limiter: Optional[RateLimiter] = None):
             if t.state == State.CREATED:
                 t = j.consent(tid, channel="web", terms_hash=form["terms_hash"])
             t = j.create_payment(tid)
-            if t.state != State.PAYMENT_PENDING or not t.payment.approve_url:
+            if t.state != State.PAYMENT_PENDING:  # already authorized, or decided: nothing to approve
                 return self._redirect(j.buyer_link(t))
+            if not t.payment.approve_url:
+                raise PayPalError("PayPal did not return an approval link for this order. Try again in a moment.")
             secure = "; Secure" if j.config.base_url.startswith("https") else ""
             return self._redirect(t.payment.approve_url, cookie=f"janus_{tid}={cred}; Path={j.config.mount}/paypal/return; "
                                                                 f"Max-Age=3600; HttpOnly; SameSite=Lax{secure}")

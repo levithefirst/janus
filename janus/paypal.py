@@ -62,7 +62,7 @@ class PayPalError(Exception):
         return self.status is None or self.status == 429 or self.status >= 500
 
 
-def _approve_link(order: dict) -> Optional[str]:
+def approve_link(order: dict) -> Optional[str]:
     for link in order.get("links", []):
         if link.get("rel") in ("payer-action", "approve"):
             return link["href"]
@@ -170,7 +170,7 @@ class PayPalSandbox:
         }
         order = self._call("create_order", "POST", "/v2/checkout/orders", ref, body,
                            request_id=request_id or make_request_id(ref, "create"))
-        return {"order_id": order["id"], "status": order.get("status"), "approve_url": _approve_link(order)}
+        return {"order_id": order["id"], "status": order.get("status"), "approve_url": approve_link(order)}
 
     def get_order(self, ref: str, order_id: str) -> dict:
         return self._call("get_order", "GET", f"/v2/checkout/orders/{order_id}", ref)

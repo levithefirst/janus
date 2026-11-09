@@ -26,7 +26,7 @@ from .models import EvidenceItem, Listing, RequirementCheck, Verdict
 from .clock import iso, parse, utcnow
 from .constants import (AUTH_VALIDITY, HONOR_PERIOD, MAX_REAUTHORIZATIONS,
                         VOID_BEFORE_EXPIRY, WARN_BEFORE_HONOR)
-from .paypal import PayPalError, make_request_id, PayPalMock, PayPalSandbox, auth_from_order
+from .paypal import PayPalError, PayPalMock, PayPalSandbox, approve_link, auth_from_order, make_request_id
 from .policy import Decision, decide, decide_items
 from .state import DECIDABLE, HOLDS_FUNDS, TERMINAL, State, TransitionError, check
 from .rules import RuleViolation
@@ -330,10 +330,10 @@ class Janus:
     def create_payment(self, tid: str) -> Threshold:
         with self._locked(tid) as t:
             rules.check_not_terminal(t)
-            if t.state != State.CREATED:  # idempotent: re-issue the same order
+            if t.state != State.CREATED:  # idempotent: re-issue the same order, never create a second one
                 if not t.payment.order_id:
                     check(t.state, State.PAYMENT_PENDING)
-                return t
+                return self._ensure_approve_url(t)
             if not rules.valid_consent(t, ("auto_capture_on_verified", "amendment", "hold")):
                 raise JanusError("the customer must consent to the terms before paying")
             base = self.config.base_url
@@ -343,7 +343,18 @@ class Janus:
             t.payment.order_id, t.payment.approve_url = order["order_id"], order["approve_url"]
             self._record(t, "paypal", "order_created", order_id=order["order_id"])
             self._move(t, State.PAYMENT_PENDING)
-            return t
+            return self._ensure_approve_url(t)
+
+    def _ensure_approve_url(self, t: Threshold) -> Threshold:
+        """A pending order must come with the PayPal link the buyer is sent to. If the create response did not
+        carry it, read it from the order instead of leaving the buyer on our own page. Caller holds the lock."""
+        p = t.payment
+        if t.state == State.PAYMENT_PENDING and p.order_id and not p.approve_url:
+            link = approve_link(self.paypal.get_order(t.id, p.order_id))
+            if link:
+                p.approve_url = link
+                self.store.save(t)
+        return t
 
     def authorize(self, tid: str) -> Threshold:
         with self._locked(tid) as t:

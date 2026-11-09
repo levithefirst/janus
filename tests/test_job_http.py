@@ -139,3 +139,111 @@ def test_cron_tick_runs_with_the_secret(tmp_path):
             urllib.request.urlopen(bad)
     finally:
         httpd.shutdown()
+
+
+# ---------- Approve PayPal hold: the first tap goes to PayPal, the second reuses the order ----------
+
+def terms_of(call, m, tid, ct):
+    html = call("GET", f"{m}/t/{tid}?t={ct}")[1]
+    return re.search(r'name="terms_hash"\s+value="([0-9a-f]{64})"', html).group(1)
+
+
+def tap(call, m, tid, ct):
+    return call("POST", f"{m}/t/{tid}/pay?t={ct}", raw=f"terms_hash={terms_of(call, m, tid, ct)}".encode())
+
+
+def test_first_tap_redirects_to_paypal_and_second_tap_reuses_the_order(env, monkeypatch):
+    j, call, m = env
+    tid, ct, pt, _ = create(call, m)
+    orders = []
+    real = j.paypal.create_order
+    monkeypatch.setattr(j.paypal, "create_order", lambda *a, **k: (orders.append(a[0]), real(*a, **k))[1])
+
+    status, _, h1 = tap(call, m, tid, ct)
+    t = j.get(tid)
+    assert status == 303 and t.state.value == "payment_pending" and len(orders) == 1
+    assert h1["Location"] == t.payment.approve_url and "/t/" not in h1["Location"]   # PayPal, not our own page
+    assert "HttpOnly" in h1["Set-Cookie"]
+
+    status, _, h2 = tap(call, m, tid, ct)                      # the buyer taps again before approving
+    assert status == 303 and h2["Location"] == h1["Location"] and "HttpOnly" in h2["Set-Cookie"]
+    assert len(orders) == 1 and j.get(tid).payment.order_id == t.payment.order_id   # no second order
+    assert len(j.paypal._db()["orders"]) == 1
+
+
+class FakeLinks:
+    """What the create-order response looks like when it carries no approval link."""
+    LINK = "https://www.sandbox.paypal.com/checkoutnow?token=ORDER-X"
+
+
+def test_missing_link_in_the_create_response_is_read_from_the_order(env, monkeypatch):
+    j, call, m = env
+    tid, ct, pt, _ = create(call, m)
+    real = j.paypal.create_order
+    monkeypatch.setattr(j.paypal, "create_order", lambda *a, **k: dict(real(*a, **k), approve_url=None))
+    gets = []
+    monkeypatch.setattr(j.paypal, "get_order", lambda ref, oid: (gets.append(oid), {
+        "id": oid, "status": "PAYER_ACTION_REQUIRED", "links": [{"rel": "payer-action", "href": FakeLinks.LINK}]})[1])
+    status, _, h = tap(call, m, tid, ct)
+    assert status == 303 and h["Location"] == FakeLinks.LINK and len(gets) == 1
+    status, _, h = tap(call, m, tid, ct)                       # stored now: no further PayPal call
+    assert status == 303 and h["Location"] == FakeLinks.LINK and len(gets) == 1
+
+
+def test_no_link_anywhere_is_an_error_not_a_silent_bounce(env, monkeypatch):
+    j, call, m = env
+    tid, ct, pt, _ = create(call, m)
+    real = j.paypal.create_order
+    monkeypatch.setattr(j.paypal, "create_order", lambda *a, **k: dict(real(*a, **k), approve_url=None))
+    monkeypatch.setattr(j.paypal, "get_order", lambda ref, oid: {"id": oid, "status": "PAYER_ACTION_REQUIRED"})
+    status, body, h = tap(call, m, tid, ct)
+    assert status == 502 and "approval link" in body and "Location" not in h
+
+
+def test_page_does_not_refresh_itself_while_the_form_is_submitting(env):
+    j, call, m = env
+    tid, ct, pt, _ = create(call, m)
+    html = call("GET", f"{m}/t/{tid}?t={ct}")[1]
+    assert "document.addEventListener('submit'" in html and "if(leaving)return" in html
+    assert "Opening PayPal" in html
+
+
+def test_first_tap_survives_the_live_refresh_in_a_real_browser(tmp_path):
+    """Regression for the live bug: the response to the first tap arrives after the new state is saved, and the
+    page's 4-second poll used to reload the page and drop the redirect. Skipped without node and playwright."""
+    import json
+    import shutil
+    import subprocess
+    import threading
+    import time
+    from http.server import ThreadingHTTPServer
+
+    from conftest import ROOT
+    from janus.security import RateLimiter
+    from janus.server import make_handler
+    node = shutil.which("node")
+    if not node or subprocess.run([node, "-e", "require('playwright')"], capture_output=True).returncode != 0:
+        pytest.skip("node with playwright is not available")
+    j = Janus(make_config(tmp_path))
+    Base = make_handler(j, RateLimiter({k: (9999, 60.0) for k in RateLimiter.LIMITS}))
+
+    class Slow(Base):
+        def _redirect(self, url, cookie=""):
+            if "/pay" in self.path:
+                time.sleep(6)       # state is saved; the redirect reaches the browser after a poll has fired
+            return super()._redirect(url, cookie)
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), Slow)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        j.config.__dict__  # frozen dataclass: the base URL must match the port, so build the job over HTTP
+        base = f"http://127.0.0.1:{httpd.server_port}"
+        import urllib.request
+        object.__setattr__(j.config, "base_url", base)
+        req = urllib.request.Request(base + "/api/jobs", data=json.dumps(
+            {"title": "Fix tap", "price": "30", "description": "Replace the washer. Stop the drip."}).encode())
+        link = json.loads(urllib.request.urlopen(req).read())["customer_link"]
+        out = subprocess.run([node, str(ROOT / "tests" / "browser" / "first_tap.js"), link, "9000"], capture_output=True,
+                             text=True, timeout=90)
+        assert "STATE=authorized" in out.stdout, out.stdout + out.stderr
+    finally:
+        httpd.shutdown()
