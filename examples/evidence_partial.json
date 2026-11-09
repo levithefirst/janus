@@ -1,0 +1,10 @@
+{
+  "items": [
+    {"requirement_id": "E1", "kind": "photo", "file": "photos/before.png",
+     "note": "Before: old faucet leaking at the base"},
+    {"requirement_id": "E3", "kind": "photo", "file": "photos/after_faucet.png",
+     "note": "New Moen faucet installed"},
+    {"requirement_id": "E4", "kind": "note",
+     "note": "Under the sink is fine now, I have a photo on my phone"}
+  ]
+}
