@@ -1,6 +1,6 @@
-# Eid
+# Janus
 
-Eid is an AI acceptance-and-release agent for local service jobs.
+Janus is an AI acceptance-and-release agent for local service jobs.
 
 ## Core flow
 
@@ -16,7 +16,7 @@ This repo is the backend only: no UI. You drive it with a CLI (`python -m eid ..
 ## Quick start (offline, no keys)
 
 ```bash
-git clone https://github.com/levithefirst/eid && cd eid
+git clone https://github.com/levithefirst/janus && cd janus
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
@@ -25,7 +25,7 @@ python -m eid demo --evidence-file examples/evidence_partial.json   # gaps -> di
 pytest -q                             # 18 tests: state machine, both outcomes, HTTP API, PayPal + Claude request shapes
 ```
 
-With no credentials set, Eid runs both integrations in **mock** mode. The PayPal mock simulates the buyer approving the order. The AI mock uses simple keyword rules and never looks at files. This tests the state machine and the plumbing, not judgement.
+With no credentials set, Janus runs both integrations in **mock** mode. The PayPal mock simulates the buyer approving the order. The AI mock uses simple keyword rules and never looks at files. This tests the state machine and the plumbing, not judgement.
 
 ## Running against PayPal sandbox and Claude
 
@@ -36,7 +36,7 @@ cp .env.example .env
 python -m eid demo
 ```
 
-The mode is chosen per integration: `EID_PAYPAL=sandbox|mock`, `EID_AI=claude|mock`. If you leave them unset, Eid uses the real integration whenever its credentials are present. You can mix them, for example real Claude with mock PayPal.
+The mode is chosen per integration: `EID_PAYPAL=sandbox|mock`, `EID_AI=claude|mock`. If you leave them unset, Janus uses the real integration whenever its credentials are present. You can mix them, for example real Claude with mock PayPal.
 
 In sandbox mode, step 3 prints a PayPal approval URL. Open it, log in with a **sandbox Personal (buyer)** account (developer.paypal.com > Testing Tools > Sandbox Accounts) and approve. The demo checks the order every 5 seconds (for up to `--wait`, 600 s by default) and authorizes it once the buyer has approved. You can see the authorization, capture or void in the sandbox merchant account's activity.
 
@@ -111,6 +111,6 @@ tests/           pytest suite (runs fully offline)
 
 ## Notes and limits
 
-- Sandbox only. PayPal authorizations have a 3-day honor period and expire after 29 days. Eid does not reauthorize.
+- Sandbox only. PayPal authorizations have a 3-day honor period and expire after 29 days. Janus does not reauthorize.
 - No auth or multi-tenancy. Anyone who can reach the API can act on any job.
-- Evidence files are given as paths on the machine running Eid. There is no upload endpoint.
+- Evidence files are given as paths on the machine running Janus. There is no upload endpoint.
