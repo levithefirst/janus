@@ -12,11 +12,11 @@ Open (not addressed yet), Accepted (a deliberate trade-off, explained).
 
 | Status | Count |
 |---|---|
-| Mitigated | 35 |
-| Partial | 8 |
-| Open | 3 |
+| Mitigated | 44 |
+| Partial | 13 |
+| Open | 1 |
 | Accepted | 3 |
-| **Total** | **49** |
+| **Total** | **61** |
 
 ## Money movement
 
@@ -55,7 +55,7 @@ Open (not addressed yet), Accepted (a deliberate trade-off, explained).
 | E1 | Reuse a photo from another job | High | Partial | 64-bit dHash index across jobs; near-duplicates force a HOLD. Gap: a determined attacker can perturb a photo past dHash; the index is per host | `test_evidence.py::test_photo_reused_from_another_job_holds` |
 | E2 | Submit the listing photo (or a stock photo of it) as evidence | High | Mitigated | Evidence is compared with the job's listing photos | `test_evidence.py::test_listing_photo_submitted_as_evidence_holds` |
 | E3 | Old photo taken before the purchase | Medium | Partial | EXIF capture time before the authorization forces a HOLD. Gap: EXIF is easy to forge or strip; missing EXIF only raises the bar | `test_evidence.py::test_photo_taken_before_authorization_holds`, `test_missing_exif_raises_the_bar` |
-| E4 | The web uploader strips EXIF (canvas resize), so web uploads always lack it | Medium | Open | Web uploads pay the no-EXIF penalty (bar 0.90). Fix needs a UI change to upload the original file, out of scope for this branch | |
+| E4 | The web uploader strips EXIF (canvas resize), so web uploads always lack it | Medium | Partial | The job page sends the original file when it is 3 MB or less, so EXIF survives. Larger photos are still shrunk on the phone (Vercel's 4.5 MB request limit) and lose EXIF, which raises the bar but never passes or fails on its own. The threshold-mode page still always shrinks | `test_job_http.py::test_good_job_partial_capture_then_void` (uploads with EXIF) |
 | E5 | Photo from somewhere else (GPS) | Low | Partial | GPS far from a declared delivery location, or inconsistent across photos, raises the bar. Gap: GPS is optional and forgeable | `test_evidence.py::test_gps_far_from_delivery_raises_bar` |
 | E6 | Blurry, dark or tiny photo gets a confident verdict | Medium | Mitigated | Quality gate holds before the AI is asked (bug in the blur measure found by calibration and fixed) | `test_evidence.py::test_blurry_dark_photo_holds_without_asking_ai`, `test_low_resolution_photo_holds`, `test_sharpness_ignores_the_unfiltered_border` |
 | E7 | Prompt injection in the note | High | Mitigated | Notes are sanitised (angle brackets neutralised), fenced in `<note>`, and instruction-like notes go to a human | `test_evidence.py::test_instruction_like_notes_hold_for_a_human`, `test_note_cannot_break_out_of_its_tag_in_the_prompt`, `test_sanitize_note` |
@@ -90,4 +90,21 @@ Open (not addressed yet), Accepted (a deliberate trade-off, explained).
 | O2 | Concurrent writers fork the audit chain | Medium | Mitigated | Exclusive lock around read-last-and-append | `test_logs_audit.py::test_audit_concurrent_appends_keep_one_chain` |
 | O3 | Crash mid-capture loses the capture record | Critical | Mitigated | See M6; recovery runs at server start and on every tick | `test_scheduler.py::test_capture_in_flight_is_not_touched_by_expiry_but_recovered` |
 | O4 | Local-time or naive timestamps shift expiry | Medium | Mitigated | One UTC clock; naive timestamps parse as UTC; EXIF without zone gets a 14-hour window | `test_clock.py` |
-| O5 | Locks on a network filesystem do not hold | Low | Open | `flock` and `O_EXCL` assume local POSIX disk. Documented assumption; a database is the real fix | |
+| O5 | Locks on a network filesystem do not hold | Low | Mitigated | On Vercel, storage is Postgres: compare-and-set writes, `INSERT ... ON CONFLICT` claims and session advisory locks replace `flock`. The file backend still assumes a local POSIX disk | `test_kv.py` (all three backends), `test_backends_flow.py` |
+| O6 | Serverless instances lose state, or two instances settle the same job | Critical | Partial | Everything persists through `janus/kv.py`; on Postgres a job is locked with a session advisory lock held for the whole operation, and saves are compare-and-set. Gap: a transaction-mode pooler (Neon `-pooler`, PgBouncer) does not keep session locks; `DATABASE_URL_UNPOOLED` is preferred for that reason, but nothing refuses a pooled URL | `test_kv.py::test_lock_is_exclusive_and_reentrant`, `test_concurrent_cas_has_one_winner`, `test_backends_flow.py::test_release_and_refund_race_settles_once` (on real Postgres 16) |
+| O7 | A once-a-day cron misses the void window and the hold expires | Medium | Mitigated | The scheduler voids 48 hours before PayPal's day-29 expiry, so a tick every 25 hours still lands inside the window | `test_scheduler.py::test_a_daily_cron_always_lands_inside_the_void_window` |
+| O8 | Anyone triggers the scheduler through the cron URL | Low | Mitigated | `/cron/tick` needs `Authorization: Bearer $CRON_SECRET`; without a configured secret it is a 404. A tick can only warn, reauthorize, void or recover, never capture | `test_job_http.py::test_cron_tick_without_the_secret_is_not_found`, `test_cron_tick_runs_with_the_secret` |
+
+## Jobs (before/after photos, the customer decides)
+
+| # | Attack | Sev | Status | Control | Proof |
+|---|---|---|---|---|---|
+| J1 | The AI's packet moves money in a job | Critical | Mitigated | The packet ends in `packet_ready` or `manual_review`; rule 7 refuses any capture not initiated by the customer | `test_jobs.py::test_clean_packet_explains_each_item_and_moves_no_money` |
+| J2 | The customer pays on a flagged packet without noticing | High | Mitigated | Accept and partial on a flagged packet need an explicit override with a reason, stored as a consent bound to that packet and logged; rule 8 re-checks it before PayPal is called | `test_jobs.py::test_reused_photo_flags_and_needs_a_logged_override`, `test_rule_refuses_capture_without_override_even_if_service_is_bypassed`, `test_override_is_bound_to_the_packet_it_was_given_for` |
+| J3 | The provider shows another job's photo, or the before photo again, as the after photo | High | Partial | Two-stage near-duplicate check (64-bit hash, then a 32x24 thumbnail). Measured on synthetic scenes the two distributions overlap, so cross-job reuse uses a looser threshold (some false flags) and after-matches-before a strict one (a brightness-edited resubmission of the before photo can pass that check). Eval: 0 false accepts on the 3 reuse cases, 2 spurious reuse flags overall | `test_jobs.py::test_reused_photo_flags_and_needs_a_logged_override`, `test_flagged_packet_can_always_be_rejected_without_override`, `eval/results-mock.md` |
+| J4 | The after photo is from another room | High | Partial | The model judges scene match; `different` is a blocking flag and `unclear` sends the job to manual review. With the mock AI all 3 wrong-room eval cases were held, 1 of them as `different`; Claude has not been run on the eval yet | `test_jobs.py::test_wrong_room_goes_to_manual_review`, `eval/results-mock.md` |
+| J5 | The after photo was edited | High | Partial | EXIF `Software` naming an editor is a blocking flag; the model also reports edit signs. A pixel edit saved without an editor tag passes the deterministic check, and the mock AI misses it (the one false accept in the eval) | `test_jobs.py::test_editor_software_flags`, `test_camera_firmware_software_tag_is_not_an_edit`, `eval/results-mock.md` |
+| J6 | The AI is down and the customer is left with nothing | Medium | Mitigated | Manual-review fallback: the job gets a `no_ai_packet` flag and the customer can still reject, or accept with an override | `test_jobs.py::test_ai_unavailable_falls_back_to_manual_review` |
+| J7 | A crash between the partial capture and the void captures twice or leaves the rest held | Critical | Mitigated | The void is written as the next pending settlement before it is sent; recovery replays it, and the capture is replayed with the same request id | `test_jobs.py::test_crash_after_partial_capture_recovers_the_void` |
+| J8 | The customer's partial amount is zero, negative, or the whole hold | Medium | Mitigated | The amount must be positive and below what is still held; paying all of it is an accept | `test_jobs.py::test_partial_amount_must_be_positive_and_below_the_hold` |
+| J9 | The provider accepts or pays part on the customer's behalf | High | Mitigated | Accept, partial and reject are customer-only routes; the provider's token gets 404 | `test_job_http.py::test_good_job_partial_capture_then_void` |
