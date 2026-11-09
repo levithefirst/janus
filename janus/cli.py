@@ -150,6 +150,10 @@ def main(argv=None) -> int:
     s.add_argument("id")
     sub.add_parser("sweep", help="status for every threshold that still holds funds")
     sub.add_parser("tick", help="run the scheduler once: recover crashes, warn, reauthorize, void before day 29")
+    s = sub.add_parser("calibrate", help="run the verifier over the small labelled set and report calibration")
+    s.add_argument("--labels", default="calibration/labels.json")
+    s = sub.add_parser("audit", help="verify the audit log's hash chain")
+    s = sub.add_parser("secret", help="print a fresh random JANUS_SECRET")
     s = sub.add_parser("serve", help="run the web app + JSON API")
     s.add_argument("--host", default="127.0.0.1"); s.add_argument("--port", type=int, default=8000)
     s = sub.add_parser("demo", help="match vs mismatch vs unclear, end to end, with PayPal before/after")
@@ -158,6 +162,10 @@ def main(argv=None) -> int:
     s.add_argument("--wait", type=int, default=600, help="seconds to wait for sandbox buyer approval")
 
     a = p.parse_args(argv)
+    if a.cmd == "secret":
+        import secrets
+        print(secrets.token_urlsafe(48))
+        return 0
     j = Janus.from_env()
     print(f"(paypal={j.paypal.mode}, ai={j.ai.mode}, data={j.config.data_dir})", file=sys.stderr)
     try:
@@ -208,6 +216,19 @@ def main(argv=None) -> int:
             from .scheduler import tick
             for act in tick(j):
                 print(f"{act['threshold_id']}  {act['action']}")
+        elif a.cmd == "calibrate":
+            from .calibration import report, run
+            res = run(j.ai, Path(a.labels), Path("."), j.config.data_dir / "calibration", j.config.min_confidence)
+            md = report(res, j.ai.mode)
+            out = Path("calibration") / f"report-{j.ai.mode}.md"
+            out.write_text(md)
+            print(md + f"\nWritten to {out}")
+            if res["unsafe_after_gate"]:
+                return 2
+        elif a.cmd == "audit":
+            ok, msg = j.audit.verify()
+            print(("OK: " if ok else "TAMPERED: ") + msg)
+            return 0 if ok else 3
         elif a.cmd == "serve":
             from .server import serve
             serve(j, a.host, a.port)

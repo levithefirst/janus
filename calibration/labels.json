@@ -1,0 +1,18 @@
+{
+  "about": "Small labelled set for the verifier. 12 cases built from 3 synthetic photos with simple transforms. Far too small for statistical claims: use it to catch regressions and gross miscalibration, not to certify accuracy.",
+  "listing": "examples/listing.json",
+  "cases": [
+    {"id": "match",            "photo": "examples/photos/received_match.jpg",    "label": "met",       "transform": null},
+    {"id": "match-rot8",       "photo": "examples/photos/received_match.jpg",    "label": "met",       "transform": "rotate:8"},
+    {"id": "match-crop80",     "photo": "examples/photos/received_match.jpg",    "label": "met",       "transform": "crop:0.8"},
+    {"id": "match-dim",        "photo": "examples/photos/received_match.jpg",    "label": "met",       "transform": "brightness:0.7"},
+    {"id": "match-mirror",     "photo": "examples/photos/received_match.jpg",    "label": "met",       "transform": "mirror"},
+    {"id": "mismatch",         "photo": "examples/photos/received_mismatch.jpg", "label": "not_met",   "transform": null},
+    {"id": "mismatch-rot8",    "photo": "examples/photos/received_mismatch.jpg", "label": "not_met",   "transform": "rotate:-8"},
+    {"id": "wrong-colour",     "photo": "examples/photos/received_match.jpg",    "label": "not_met",   "transform": "hue:120"},
+    {"id": "wrong-colour-dim", "photo": "examples/photos/received_match.jpg",    "label": "not_met",   "transform": "hue:200,brightness:0.8"},
+    {"id": "greyscale",        "photo": "examples/photos/received_match.jpg",    "label": "uncertain", "transform": "grey"},
+    {"id": "blurred",          "photo": "examples/photos/received_match.jpg",    "label": "uncertain", "transform": "blur:12"},
+    {"id": "dark-blurry",      "photo": "examples/photos/received_unclear.jpg",  "label": "uncertain", "transform": null}
+  ]
+}
