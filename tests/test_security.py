@@ -185,3 +185,28 @@ def test_no_secret_or_token_is_written_to_disk(env):
         assert secret not in blob
     logs = (j.config.data_dir / "janus.log.jsonl").read_text() + (j.config.data_dir / "audit.jsonl").read_text()
     assert "7946" not in logs and "me@example.com" not in logs
+
+
+# ---------- input hardening ----------
+
+def test_decompression_bomb_is_refused(janus):
+    import io
+
+    from PIL import Image
+
+    from janus.service import JanusError, normalize_image
+    out = io.BytesIO()
+    Image.new("L", (8000, 6000)).save(out, "PNG")  # ~48 MP of zeros: a small file
+    assert len(out.getvalue()) < 1_000_000
+    with pytest.raises(JanusError, match="too large"):
+        normalize_image(out.getvalue())
+
+
+def test_submitter_text_is_escaped_in_pages(env):
+    j, call = env
+    evil = '<script>alert(1)</script><img src=x onerror=alert(2)>'
+    status, d, _ = call("POST", "/api/thresholds", dict(LISTING, title=evil, description=evil, condition=evil))
+    bt, st = tokens(d)
+    for tok, q in ((bt, "t"), (st, "k")):
+        html = call("GET", f"/t/{d['id']}?{q}={tok}")[1]
+        assert "<script>alert(1)" not in html and "<img src=x" not in html and "&lt;script&gt;" in html

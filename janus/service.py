@@ -35,6 +35,7 @@ from .store import Amendment, Capture, Consent, Outcome, Pending, Store, Thresho
 
 ImageInput = Union[str, Path, bytes]
 MAX_IMAGE_BYTES = 12 * 1024 * 1024
+MAX_IMAGE_PIXELS = 40_000_000  # 40 MP: above any phone camera
 _MAGIC = {b"\xff\xd8\xff": ("image/jpeg", ".jpg"), b"\x89PNG": ("image/png", ".png"),
           b"GIF8": ("image/gif", ".gif"), b"RIFF": ("image/webp", ".webp")}
 
@@ -71,7 +72,13 @@ def normalize_image(data: bytes) -> tuple[bytes, str, str]:
                 return data, mt, ext
         raise JanusError("not a JPEG, PNG, GIF or WebP image")
     try:
-        img = ImageOps.exif_transpose(Image.open(io.BytesIO(data))).convert("RGB")
+        probe = Image.open(io.BytesIO(data))  # reads the header only
+    except Exception:
+        raise JanusError("could not read that file as an image")
+    if probe.width * probe.height > MAX_IMAGE_PIXELS:  # decompression bomb: tiny file, huge image
+        raise JanusError(f"image is too large ({probe.width}x{probe.height})")
+    try:
+        img = ImageOps.exif_transpose(probe).convert("RGB")
     except Exception:
         raise JanusError("could not read that file as an image")
     img.thumbnail((1600, 1600))
