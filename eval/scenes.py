@@ -32,8 +32,12 @@ ROOMS = {
 }
 
 
-def draw(room: Room, job: str, done: bool, seed: int = 0, shift: int = 0, light: float = 1.0) -> Image.Image:
+def draw(room: Room, job: str, done: bool, seed: int = 0, shift: int = 0, light: float = 1.0,
+         layout: Optional[int] = None) -> Image.Image:
+    """`layout` fixes where the window, door and picture are (a given room in a given house); `seed` only
+    varies sensor noise. Before and after of one job share a layout; different jobs do not."""
     rnd = random.Random(seed)
+    lay = random.Random(layout if layout is not None else seed)
     img = Image.new("RGB", (W, H), room.wall)
     d = ImageDraw.Draw(img)
     horizon = int(H * 0.68)
@@ -41,9 +45,17 @@ def draw(room: Room, job: str, done: bool, seed: int = 0, shift: int = 0, light:
     for x in range(0, W, 80):  # floor boards
         d.line([(x + shift, horizon), (x + shift - 40, H)], fill=tuple(max(0, c - 18) for c in room.floor), width=3)
     d.rectangle([0, horizon - 14, W, horizon], fill=room.trim)
-    wx = 60 if room.window_left else W - 300
-    d.rectangle([wx + shift, 90, wx + 240 + shift, 330], fill=(200, 225, 245), outline=room.trim, width=12)
-    d.line([(wx + 120 + shift, 90), (wx + 120 + shift, 330)], fill=room.trim, width=8)
+    ww, wh = lay.randint(170, 260), lay.randint(170, 250)
+    wx = lay.randint(30, 110) if room.window_left else W - ww - lay.randint(30, 110)
+    wy = lay.randint(60, 130)
+    d.rectangle([wx + shift, wy, wx + ww + shift, wy + wh], fill=(200, 225, 245), outline=room.trim, width=12)
+    d.line([(wx + ww // 2 + shift, wy), (wx + ww // 2 + shift, wy + wh)], fill=room.trim, width=8)
+    dx = (W - lay.randint(150, 260)) if room.window_left else lay.randint(40, 150)
+    d.rectangle([dx + shift, horizon - 330, dx + 120 + shift, horizon - 14],
+                fill=tuple(max(0, c - 40) for c in room.wall), outline=room.trim, width=8)
+    px_, py_ = lay.randint(330, 560), lay.randint(70, 120)
+    d.rectangle([px_ + shift, py_, px_ + 90 + shift, py_ + 64], outline=(60, 50, 40), width=6,
+                fill=(lay.randint(40, 220), lay.randint(40, 220), lay.randint(40, 220)))
     cx, cy = W // 2 + shift, int(H * 0.42)
     if job == "hole":
         if not done:
