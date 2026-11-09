@@ -24,14 +24,16 @@ VOID_BEFORE_EXPIRY = timedelta(hours=24)       # void this long before day 29, s
 #   amount, not to exceed an increase of $75 USD." A reauthorization gets a new id and a new 3-day honor
 #   period, but not a new 29 days: after 29 (the spec says 30) days from the ORIGINAL authorization you must
 #   create a new authorization instead.
-# TODO(sandbox): the count is not settled by the docs. The checkout guide and one spec description say
-#   "multiple re-authorizations" within the 29 days; another description in the same spec says "only once
-#   from days four to 29". Until a live Sandbox run settles it, we allow one.
-REAUTHORIZE_MAX_COUNT = None
+# TODO(sandbox): PayPal's docs conflict on how many reauthorizations are allowed. The checkout guide and one
+#   description in the spec say "multiple re-authorizations" within the 29 days; another description in the
+#   same spec says "only once from days four to 29". Sources:
+#     https://developer.paypal.com/docs/api/payments/v2/#authorizations_reauthorize
+#     https://github.com/paypal/paypal-rest-api-specifications/blob/main/openapi/payments_payment_v2.json
+#   Until a live Sandbox run settles it, we allow exactly one. This is the only place the number lives.
+MAX_REAUTHORIZATIONS = 1
 REAUTHORIZE_MAX_PERCENT = 115            # US example in the docs; other regions may differ
 REAUTHORIZE_MAX_INCREASE_USD = "75.00"   # US example in the docs; cap on the increase, not the total
 REAUTHORIZE_EARLIEST = HONOR_PERIOD      # docs: reauthorize only after the 3-day honor period expires
-REAUTHORIZE_ATTEMPTS_ALLOWED = 1         # our own conservative cap while REAUTHORIZE_MAX_COUNT is unsettled
 
 # Void. Source: Payments v2 "Void authorized payment" (same links as above):
 #   "You cannot void an authorized payment that has been fully captured."

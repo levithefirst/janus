@@ -98,3 +98,22 @@ def test_capture_in_flight_is_not_touched_by_expiry_but_recovered(setup, monkeyp
         j.submit_and_verify(t.id, PHOTOS / "received_match.jpg")
     monkeypatch.undo()
     assert acts(j) == ["recovered:captured"]
+
+
+def test_second_reauthorization_is_refused_and_flagged(setup):
+    from janus.constants import MAX_REAUTHORIZATIONS
+    j, t, travel = setup
+    assert MAX_REAUTHORIZATIONS == 1
+    calls = []
+    real = j.paypal.reauthorize
+    j.paypal.reauthorize = lambda *a, **k: (calls.append(a), real(*a, **k))[1]
+    travel.advance(timedelta(days=3, minutes=1))
+    assert acts(j) == ["reauthorized"] and len(calls) == 1
+    travel.advance(timedelta(days=3, minutes=1))               # the next honor period is over too
+    assert acts(j) == ["new_authorization_requested"]
+    assert len(calls) == 1                                      # PayPal was not asked a second time
+    x = j.get(t.id)
+    assert x.payment.reauthorize_count == 1 and x.payment.needs_new_authorization
+    alert = [e for e in j.audit.entries(t.id) if e["kind"] == "new_authorization_needed"]
+    assert len(alert) == 1 and alert[0]["data"]["severity"] == "high" and alert[0]["data"]["reauthorize_count"] == 1
+    assert acts(j) == [] and len(calls) == 1                    # flagged once, then quiet

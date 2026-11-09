@@ -24,7 +24,7 @@ from .logs import log_event, now, setup
 from . import evidence as ev
 from .models import EvidenceItem, Listing, RequirementCheck, Verdict
 from .clock import iso, parse, utcnow
-from .constants import (AUTH_VALIDITY, HONOR_PERIOD, REAUTHORIZE_ATTEMPTS_ALLOWED, REAUTHORIZE_MAX_COUNT,
+from .constants import (AUTH_VALIDITY, HONOR_PERIOD, MAX_REAUTHORIZATIONS,
                         VOID_BEFORE_EXPIRY, WARN_BEFORE_HONOR)
 from .paypal import PayPalError, make_request_id, PayPalMock, PayPalSandbox, auth_from_order
 from .policy import Decision, decide, decide_items
@@ -590,9 +590,7 @@ class Janus:
         p = t.payment
         if p.needs_new_authorization:
             return []
-        limit = REAUTHORIZE_ATTEMPTS_ALLOWED if REAUTHORIZE_MAX_COUNT is None else min(
-            REAUTHORIZE_ATTEMPTS_ALLOWED, REAUTHORIZE_MAX_COUNT)
-        if p.reauthorize_count < limit and not p.captures:
+        if p.reauthorize_count < MAX_REAUTHORIZATIONS and not p.captures:
             rid = make_request_id(t.id, "reauthorize", p.reauthorize_count + 1)
             try:
                 r = self.paypal.reauthorize(t.id, p.authorization_id, rid)
