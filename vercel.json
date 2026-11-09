@@ -1,0 +1,13 @@
+{
+  "functions": {
+    "api/index.py": { "maxDuration": 60 }
+  },
+  "rewrites": [
+    { "source": "/app", "destination": "/api/index?__path=/app" },
+    { "source": "/app/:path*", "destination": "/api/index?__path=/app/:path*" },
+    { "source": "/paypal/:path*", "destination": "/api/index?__path=/paypal/:path*" }
+  ],
+  "crons": [
+    { "path": "/app/cron/tick", "schedule": "17 6 * * *" }
+  ]
+}

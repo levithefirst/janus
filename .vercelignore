@@ -1,0 +1,10 @@
+.venv
+data
+tests
+eval/cases
+calibration
+examples/make_photos.py
+docs
+scripts
+.pytest_cache
+**/__pycache__
