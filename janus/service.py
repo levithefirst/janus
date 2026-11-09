@@ -23,7 +23,8 @@ from .config import Config
 from .logs import log_event, now, setup
 from .models import EvidenceItem, Listing
 from .clock import iso, parse, utcnow
-from .constants import AUTH_VALIDITY, HONOR_PERIOD
+from .constants import (AUTH_VALIDITY, HONOR_PERIOD, REAUTHORIZE_ATTEMPTS_ALLOWED, REAUTHORIZE_MAX_COUNT,
+                        VOID_BEFORE_EXPIRY, WARN_BEFORE_HONOR)
 from .paypal import PayPalError, make_request_id, PayPalMock, PayPalSandbox, auth_from_order
 from .policy import decide
 from .state import HOLDS_FUNDS, TERMINAL, State, TransitionError, check
@@ -295,6 +296,24 @@ class Janus:
             check(t.state, State.VOIDING)
             return self._start(t, "void", "seller", note or "Seller refunded the buyer")
 
+    def dispute(self, tid: str, reason: str) -> Threshold:
+        """The customer objects while funds are held. Automatic settlement stops until it is resolved."""
+        if not reason.strip():
+            raise JanusError("a dispute needs a reason")
+        with self._locked(tid) as t:
+            check(t.state, State.DISPUTED)
+            self._move(t, State.DISPUTED, reason=reason[:500])
+            self._audit(t, "dispute_opened", "buyer", reason[:500])
+            return t
+
+    def withdraw_dispute(self, tid: str) -> Threshold:
+        with self._locked(tid) as t:
+            if t.state != State.DISPUTED:
+                raise TransitionError(f"no open dispute (state is '{t.state.value}')")
+            self._move(t, State.HELD, reason="dispute withdrawn")
+            self._audit(t, "dispute_withdrawn", "buyer", "customer withdrew the dispute")
+            return t
+
     def retry_settlement(self, tid: str) -> Threshold:
         """Re-run a capture or void that failed with a retryable error. Same PayPal-Request-Id."""
         with self._locked(tid) as t:
@@ -334,6 +353,69 @@ class Janus:
 
     def sweep(self) -> list[Threshold]:
         return [self.refresh(t.id) for t in self.store.all() if t.state in HOLDS_FUNDS]
+
+    # --- expiry scheduler (see scheduler.py) ---
+
+    def expiry_tick(self, tid: str) -> list[str]:
+        """One scheduler step for one threshold. Warns, reauthorizes, asks for a new authorization,
+        or voids before day 29. It never captures: a silent customer never leads to a capture."""
+        with self._locked(tid) as t:
+            if t.state not in HOLDS_FUNDS or t.state in (State.CAPTURING, State.VOIDING):
+                return []
+            p, now_ = t.payment, utcnow()
+            authorized_at = _parse_ts(p.authorized_at)
+            original = _parse_ts(p.original_authorized_at) or authorized_at
+            if authorized_at is None:
+                return []
+            expiry = original + AUTH_VALIDITY
+            if (paypal_exp := _parse_ts(p.expiration_time)) is not None:
+                expiry = min(expiry, paypal_exp)
+            if now_ >= expiry - VOID_BEFORE_EXPIRY:
+                self._start(t, "void", "scheduler", "The authorization is about to expire and the condition was "
+                                                    "not settled. Voided so the customer's funds are released.")
+                return ["voided_before_expiry"]
+            if now_ >= authorized_at + HONOR_PERIOD:
+                return self._after_honor(t)
+            if now_ >= authorized_at + HONOR_PERIOD - WARN_BEFORE_HONOR and not p.honor_warned:
+                p.honor_warned = True
+                self.store.save(t)
+                self._audit(t, "honor_period_warning", "scheduler", "the 3-day PayPal honor period ends soon",
+                            honor_ends=iso(authorized_at + HONOR_PERIOD))
+                return ["warned"]
+            return []
+
+    def _after_honor(self, t: Threshold) -> list[str]:
+        p = t.payment
+        if p.needs_new_authorization:
+            return []
+        limit = REAUTHORIZE_ATTEMPTS_ALLOWED if REAUTHORIZE_MAX_COUNT is None else min(
+            REAUTHORIZE_ATTEMPTS_ALLOWED, REAUTHORIZE_MAX_COUNT)
+        if p.reauthorize_count < limit and not p.captures:
+            rid = make_request_id(t.id, "reauthorize", p.reauthorize_count + 1)
+            try:
+                r = self.paypal.reauthorize(t.id, p.authorization_id, rid)
+            except PayPalError as e:
+                if e.retryable:
+                    p.last_error = str(e)
+                    self.store.save(t)
+                    return ["reauthorize_retry_pending"]
+                self._audit(t, "reauthorize_failed", "scheduler", str(e), issue=e.issue)
+            else:
+                p.previous_authorization_ids.append(p.authorization_id)
+                p.authorization_id, p.authorization_status = r["authorization_id"], r["status"]
+                p.authorized_at, p.reauthorize_count, p.honor_warned = now(), p.reauthorize_count + 1, False
+                p.expiration_time = r.get("expiration_time") or p.expiration_time
+                self.store.save(t)
+                self._audit(t, "reauthorized", "scheduler", "honor period over; funds reauthorized",
+                            request_id=rid, authorization_id=p.authorization_id,
+                            previous=p.previous_authorization_ids[-1])
+                return ["reauthorized"]
+        p.needs_new_authorization = True
+        self.store.save(t)
+        self._audit(t, "new_authorization_needed", "scheduler",
+                    "honor period over and reauthorization is not possible; ask the customer to authorize again",
+                    severity="high", reauthorize_count=p.reauthorize_count)
+        return ["new_authorization_requested"]
 
     def _sync(self, t: Threshold) -> dict:
         a = self.paypal.get_authorization(t.id, t.payment.authorization_id)

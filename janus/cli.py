@@ -147,6 +147,7 @@ def main(argv=None) -> int:
     s = sub.add_parser("status", help="read the live authorization status from PayPal (detects expiry)")
     s.add_argument("id")
     sub.add_parser("sweep", help="status for every threshold that still holds funds")
+    sub.add_parser("tick", help="run the scheduler once: recover crashes, warn, reauthorize, void before day 29")
     s = sub.add_parser("serve", help="run the web app + JSON API")
     s.add_argument("--host", default="127.0.0.1"); s.add_argument("--port", type=int, default=8000)
     s = sub.add_parser("demo", help="match vs mismatch vs unclear, end to end, with PayPal before/after")
@@ -198,6 +199,10 @@ def main(argv=None) -> int:
             for t in j.sweep():
                 print(f"{t.id}  {t.state.value:<18} auth={t.payment.authorization_status} "
                       f"expires={t.payment.expiration_time}")
+        elif a.cmd == "tick":
+            from .scheduler import tick
+            for act in tick(j):
+                print(f"{act['threshold_id']}  {act['action']}")
         elif a.cmd == "serve":
             from .server import serve
             serve(j, a.host, a.port)

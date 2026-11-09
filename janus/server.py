@@ -471,6 +471,11 @@ def make_handler(j: Janus):
 
 
 def serve(j: Janus, host: str = "127.0.0.1", port: int = 8000) -> None:
+    import os
+
+    from .scheduler import start_background, tick
+    tick(j)  # recover settlements interrupted by a crash before taking traffic
+    start_background(j, float(os.environ.get("JANUS_TICK_SECONDS", "300")))
     httpd = ThreadingHTTPServer((host, port), make_handler(j))
     print(f"Janus Threshold on http://{host}:{port}  (paypal={j.paypal.mode}, ai={j.ai.mode}, "
           f"public URL={j.config.base_url})")
