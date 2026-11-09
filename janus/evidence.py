@@ -113,6 +113,41 @@ def hamming(a: str, b: str) -> int:
     return bin(int(a, 16) ^ int(b, 16)).count("1")
 
 
+THUMB = (32, 24)
+# Second-stage thresholds: mean absolute difference of mean-normalised 32x24 grey thumbnails (0-255).
+# Measured on the synthetic scenes (eval/scenes.py): true copies, resized to 70-95% or brightness +-10%,
+# reach 4.32; different photos whose 64-bit hashes collide go as low as 2.61. The ranges overlap, so the two
+# checks get different thresholds, chosen by what a mistake costs:
+REUSE_MAX_MAD = 4.5       # across jobs: catch edited copies; a false flag only means manual review
+NO_CHANGE_MAX_MAD = 2.0   # before vs after in one job: near-identity only, so small genuine repairs pass
+
+
+def thumb(img) -> str:
+    """A 32x24 greyscale thumbnail, hex encoded: the second check behind the 64-bit hash."""
+    return img.convert("L").resize(THUMB).tobytes().hex()
+
+
+def thumb_mad(a: str, b: str) -> float:
+    """Mean absolute difference after removing each thumbnail's mean (so a uniform brightness edit cancels)."""
+    x, y = bytes.fromhex(a), bytes.fromhex(b)
+    if len(x) != len(y) or not x:
+        return 255.0
+    mx, my = sum(x) / len(x), sum(y) / len(y)
+    return sum(abs((i - mx) - (j - my)) for i, j in zip(x, y)) / len(x)
+
+
+def same_photo(phash_a: Optional[str], phash_b: Optional[str], thumb_a: Optional[str] = None,
+               thumb_b: Optional[str] = None, max_mad: float = REUSE_MAX_MAD) -> bool:
+    """Two-stage near-duplicate test. A 64-bit hash alone collides for different photos of similar scenes
+    (two jobs in the same room, or before and after of a small repair), so when both thumbnails are known
+    they must also match closely, pixel for pixel."""
+    if not phash_a or not phash_b or hamming(phash_a, phash_b) > REUSE_MAX_DISTANCE:
+        return False
+    if thumb_a and thumb_b:
+        return thumb_mad(thumb_a, thumb_b) <= max_mad
+    return True
+
+
 def analyze(raw: bytes) -> dict:
     """Quality, perceptual hash and EXIF of the original upload. Pillow is required for evidence."""
     from PIL import Image, ImageFilter, ImageOps, ImageStat
@@ -136,13 +171,22 @@ def analyze(raw: bytes) -> dict:
     if bright < MIN_BRIGHTNESS:
         reasons.append(f"too dark (brightness {bright:.0f} < {MIN_BRIGHTNESS:.0f})")
     return {"width": w, "height": h, "sharpness": round(sharp, 1), "brightness": round(bright, 1),
-            "quality_ok": not reasons, "quality_reasons": reasons, "phash": dhash(img), "exif": exif}
+            "quality_ok": not reasons, "quality_reasons": reasons, "phash": dhash(img), "thumb": thumb(img),
+            "exif": exif}
 
 
 def phash_of_file(path: Path) -> Optional[str]:
     try:
         from PIL import Image
         return dhash(Image.open(path).convert("RGB"))
+    except Exception:
+        return None
+
+
+def thumb_of_file(path: Path) -> Optional[str]:
+    try:
+        from PIL import Image
+        return thumb(Image.open(path).convert("RGB"))
     except Exception:
         return None
 
@@ -159,13 +203,14 @@ class PhashIndex:
     def entries(self) -> list[dict]:
         return self.kv.stream(self.STREAM)
 
-    def add_and_match(self, threshold_id: str, evidence_id: str, phash: str) -> list[dict]:
-        """Record this hash and return near-duplicates from OTHER jobs, atomically."""
+    def add_and_match(self, threshold_id: str, evidence_id: str, phash: str,
+                      thumb_hex: Optional[str] = None) -> list[dict]:
+        """Record this photo and return near-duplicates from OTHER jobs, atomically."""
         with self.kv.lock(f"index:{self.STREAM}"):
             hits = [e for e in self.entries()
-                    if e["threshold_id"] != threshold_id and hamming(e["phash"], phash) <= REUSE_MAX_DISTANCE]
+                    if e["threshold_id"] != threshold_id and same_photo(e["phash"], phash, e.get("thumb"), thumb_hex)]
             self.kv.append(self.STREAM, lambda last: {"threshold_id": threshold_id, "evidence_id": evidence_id,
-                                                      "phash": phash, "at": iso()})
+                                                      "phash": phash, "thumb": thumb_hex, "at": iso()})
             return hits
 
 
@@ -289,7 +334,7 @@ def job_flags(evidence: list, authorized_at: Optional[str]) -> JobCheck:
             block(f"edited_software:{e.id}")
     for a in after:
         for b in before:
-            if a.phash and b.phash and hamming(a.phash, b.phash) <= REUSE_MAX_DISTANCE:
+            if same_photo(a.phash, b.phash, a.thumb, b.thumb, max_mad=NO_CHANGE_MAX_MAD):
                 block(f"after_matches_before:{a.id}")
     auth = parse(authorized_at)
     times = {}

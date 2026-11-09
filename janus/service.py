@@ -411,13 +411,13 @@ class Janus:
                 info = ev.analyze(raw)
                 item.quality = {k: info[k] for k in ("width", "height", "sharpness", "brightness")} | {
                     "ok": info["quality_ok"], "reasons": info["quality_reasons"]}
-                item.exif, item.phash = info["exif"], info["phash"]
+                item.exif, item.phash, item.thumb = info["exif"], info["phash"], info["thumb"]
                 item.file, item.media_type, item.sha256 = self._ingest(t, raw, "evidence", item.id)
-                for hit in self.phash_index.add_and_match(t.id, item.id, item.phash):
+                for hit in self.phash_index.add_and_match(t.id, item.id, item.phash, item.thumb):
                     item.flags.append(f"reused_photo:{hit['threshold_id']}/{hit['evidence_id']}")
                 for lp in t.listing.photos:
-                    lh = ev.phash_of_file(self.store.dir(t.id) / lp)
-                    if lh and ev.hamming(lh, item.phash) <= ev.REUSE_MAX_DISTANCE:
+                    path = self.store.dir(t.id) / lp
+                    if ev.same_photo(ev.phash_of_file(path), item.phash, ev.thumb_of_file(path), item.thumb):
                         item.flags.append("matches_listing_photo")
             t.evidence.append(item)
             self._record(t, "state", "evidence_added", evidence_id=item.id, by=by, has_photo=bool(item.file),

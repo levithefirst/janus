@@ -72,6 +72,7 @@ class EvidenceItem(BaseModel):
     quality: dict = Field(default_factory=dict)  # width, height, sharpness, brightness, ok, reasons
     exif: dict = Field(default_factory=dict)     # present, taken_at, offset, gps (rounded to ~100 m)
     phash: Optional[str] = None
+    thumb: Optional[str] = None                  # 16x12 greyscale, hex: second stage of near-duplicate checks
     flags: list[str] = Field(default_factory=list)
     file: Optional[str] = None          # path inside the threshold's data dir
     media_type: Optional[str] = None
