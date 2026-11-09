@@ -2,21 +2,96 @@
 
 **Get paid when the work is accepted.**
 
-The provider describes a job. Janus writes the checklist. The customer approves a PayPal hold (Orders v2,
-`intent: AUTHORIZE`): the money is there before work starts, but nothing is taken. The provider uploads before
-and after photos. Janus checks them and writes an acceptance packet. **Only the customer decides**:
+Janus is a payment hold for service jobs. The provider describes a job and Janus (with Claude) writes the
+checklist. The customer approves a PayPal hold (Orders v2, `intent: AUTHORIZE`): the money is reserved before
+work starts, but nothing is taken. The provider uploads before and after photos; Janus checks them and Claude
+writes an acceptance packet. **Only the customer decides**: Accept (PayPal CAPTURE), pay part (a partial
+CAPTURE, then VOID of the rest), or Reject (VOID, nothing charged). The provider is the PayPal merchant; Janus
+never holds funds, it only tells PayPal to capture or void the customer's authorization.
 
-| Customer taps | What Janus asks PayPal to do |
+## What the AI can and cannot do
+
+- **Can:** turn the provider's description into a checklist, and judge the before and after photos item by item
+  (pass, fail or unclear, with a confidence and a one-line reason), plus whether both photos show the same place
+  and whether a photo looks edited.
+- **Cannot:** move money. The packet is advice. No code path lets the AI, the scheduler, a webhook or the
+  provider capture in a job; only the customer's own tap can.
+- **Hard rules gate every capture** (`janus/rules.py`, listed [below](#hard-rules-checked-immediately-before-every-capture)),
+  checked immediately before PayPal is called, independently of the AI and the policy.
+- **A flagged packet needs a logged customer override**: ticking the override and giving a reason, stored as a
+  consent bound to that exact packet and written to the audit trail. Rejecting never needs one.
+
+## Try it live (PayPal Sandbox)
+
+Live app: **https://usejanus.vercel.app/app**. It talks to PayPal Sandbox, so no real money moves. To approve a
+hold you need **your own Sandbox buyer account**: on developer.paypal.com, open Testing Tools, Sandbox Accounts,
+and use (or create) a Personal account. No credentials are published here.
+
+1. Open the app, describe a small job and a price, tap **Write the checklist**. You are now the provider; copy the
+   customer link (open it in a second window or on your phone).
+2. As the customer, read the checklist and tap **Approve PayPal hold**. Log in to PayPal with your Sandbox buyer
+   account and approve. You come back to the job page: "PayPal is holding ...".
+3. As the provider, upload a before photo and an after photo, then tap **Build acceptance packet**.
+4. As the customer, read the packet and choose Accept, pay part, or Reject. The PayPal record and the live audit
+   trail on the page show each call; **Verify chain** re-checks the audit hashes.
+
+The footer of the create page shows which PayPal mode, AI mode and storage the deployment runs.
+
+## How PayPal is used
+
+| Step | PayPal API |
 |---|---|
-| Accept | CAPTURE the full hold |
-| Pay part (enters an amount) | CAPTURE that amount (`final_capture: false`), then VOID the rest |
-| Reject | VOID the hold: nothing is charged |
+| Customer approves the hold | Orders v2: create order with `intent: AUTHORIZE`, then authorize the approved order |
+| Accept | Payments v2: capture the authorization (`final_capture: true`) |
+| Pay part | capture with an amount and `final_capture: false`, then void the authorization (releases the rest) |
+| Reject, or the hold is about to expire | void the authorization |
+| After the 3-day honor period | reauthorize (once); if that is not possible, the customer is asked to approve a new hold |
+| Hold lapsed before the customer decided | a fresh order with `intent: AUTHORIZE` for the same job; the old authorization is voided or has expired |
+| Status changes | verified webhooks (PayPal's verify-webhook-signature API), each only triggers a fresh read from PayPal |
 
-Janus never holds funds. The provider is the PayPal merchant; Janus only tells PayPal to capture or void the
-customer's authorization. The AI never moves money: its packet is advice, and hard rules run immediately before
-every capture.
+Every mutating call carries a `PayPal-Request-Id`, written to storage before the call, so retries and crash
+recovery never capture twice.
 
-## Try it in 2 minutes (no keys needed)
+## How AI is used
+
+Claude (`claude-opus-5-5` by default, `JANUS_MODEL` to change it) through the Anthropic API with structured
+outputs: once to write the checklist from the job description, and once per packet with both photos as images.
+If Claude is unavailable the job goes to manual review (`no_ai_packet`) and the customer still decides. Without
+`ANTHROPIC_API_KEY` a mock AI (pixel comparisons) runs so every path can be exercised offline; it does not judge
+real work.
+
+## Fraud checks that need no AI
+
+These run on the photos before Claude sees them. Any hit is a blocking flag (manual review, override needed):
+
+- **Reused photo**: a near copy of a photo from another job, or the before photo again. Caught by a 64-bit
+  perceptual hash confirmed by a 32x24 thumbnail comparison, **not by Claude**.
+- **Pasted or retouched area**: one connected area much smoother than the rest of the photo's sensor noise
+  (`pixel_inconsistency`).
+- **Editing app**: the EXIF `Software` tag names an editor.
+- **Times that do not add up**: EXIF says the after photo was taken before the hold, before the before photo, or
+  in the future.
+
+Claude adds its own judgement on top (`wrong_room`, `likely_edited`, `possible_edit`); it never removes a flag.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  P[Provider phone] -->|job, before and after photos| S[Janus server]
+  C[Customer phone] -->|approve hold, accept, part, reject| S
+  S -->|checklist, packet| AI[Claude]
+  S --> EV[Deterministic checks: hash, thumbnail, noise, EXIF]
+  S --> R{Hard rules}
+  R -->|only if every rule passes| PP[PayPal Orders v2 and Payments v2]
+  PP -->|signed webhooks| S
+  Cron[Vercel Cron] -->|/cron/tick: warn, reauthorize, void before expiry| S
+  S --> DB[(Postgres, SQLite or files: jobs, photos, hash-chained audit)]
+```
+
+Claude has no path to PayPal: its output only reaches the customer's page.
+
+## Run locally
 
 ```bash
 git clone https://github.com/levithefirst/janus && cd janus
@@ -24,12 +99,31 @@ git clone https://github.com/levithefirst/janus && cd janus
 source .venv/bin/activate
 python scripts/demo_jobs.py     # the two demo runs, end to end, in the terminal
 python -m janus serve           # the app on http://localhost:8000 (phone-friendly)
+pytest -q                       # tests (set JANUS_TEST_DATABASE_URL to include the Postgres backend)
 ```
 
 With no keys, PayPal and the AI run as offline stand-ins. **Mock PayPal** uses PayPal's real error names,
 replays by `PayPal-Request-Id`, and supports partial capture, void, reauthorize, refund and signed webhooks.
 **Mock AI** compares pixels (room colours around the work area, how much the work area changed) and reads the
-EXIF `Software` tag. It exercises every path; it does not judge real work. Use Claude for that.
+EXIF `Software` tag. To use the real services, see
+[Run locally against PayPal Sandbox and Claude](#run-locally-against-paypal-sandbox-and-claude).
+
+## Eval results (real Claude)
+
+> **TODO: not run yet.** Run `python -m eval.run_eval --ai claude --write eval/results-claude.md` (needs
+> `ANTHROPIC_API_KEY`) and paste the summary here. No Claude numbers are claimed until then.
+
+Mock AI results, for comparison only (`eval/results-mock.md`, 13 synthetic cases; a check that the defences
+fire, not a measurement of real-world error rates): **0 of 9** false accepts, **1 of 4** false rejects, 2 spurious
+reuse flags. Details in [Eval](#eval).
+
+## Security docs
+
+[THREAT_MODEL](docs/THREAT_MODEL.md) (actors, trust boundaries) · [ATTACKS](docs/ATTACKS.md) (every known attack,
+severity, status and the test that proves it) · [HARD_QUESTIONS](docs/HARD_QUESTIONS.md) (expiry, disputes,
+AI mistakes) · [CONFIDENCE](docs/CONFIDENCE.md)
+
+---
 
 ## Demo script: the two runs
 
@@ -65,6 +159,7 @@ and deterministic checks that need no AI:
 | `reused_photo` | a photo is a near copy of one uploaded to another job (64-bit perceptual hash, confirmed by a 32x24 thumbnail) |
 | `after_matches_before` | the after photo is near-identical to the before photo |
 | `edited_software` | the EXIF `Software` tag names an editing app (Photoshop, Snapseed, Lightroom, ...); camera firmware does not count |
+| `pixel_inconsistency` | one connected area of the after photo is much smoother than the rest of its sensor noise (pasted, blurred or retouched); thresholds and their calibration are in `janus/evidence.py` |
 | `likely_edited`, `possible_edit` | the model sees signs of editing |
 | `wrong_room` | the model says before and after are different places |
 | `after_taken_before_authorization`, `after_older_than_before`, `taken_in_future` | EXIF capture times are inconsistent |
@@ -103,6 +198,12 @@ Capture amounts must be positive. Every check (pass or block) goes into the audi
   The scheduler warns 12 hours before day 3, reauthorizes once (`MAX_REAUTHORIZATIONS = 1`; PayPal's docs
   conflict on the limit) or flags that a new authorization is needed, and **voids 48 hours before day 29**, so a
   once-a-day cron still lands in time. It never captures.
+- **Lapsed hold**: in a job, a hold that expires or is voided before the customer decides does not close the job.
+  The job moves to `hold_lapsed` and the customer sees **Approve a new hold**: a new PayPal order for the same job,
+  same checklist and photos. The old order and authorization are linked in the audit chain. If reauthorization
+  was not possible and the old hold is still open, the new hold is authorized first and then the old one voided.
+  A late capture on the old hold always wins: the new hold is never authorized, or is voided at once. Rule 9
+  stops a capture on a replaced authorization and any total above the price.
 - **Scheduling**: `python -m janus tick`, every `JANUS_TICK_SECONDS` inside `serve`, or Vercel Cron calling
   `/app/cron/tick` with `Authorization: Bearer $CRON_SECRET` (daily in `vercel.json`, the Hobby plan limit).
 - **Retries**: every mutating PayPal call carries `PayPal-Request-Id: janus-<job>-<action>[-n]`. The exact
@@ -134,8 +235,7 @@ Result with the mock AI, as produced (`eval/results-mock.md`):
 - **False rejects: 1 of 4** good cases (`good-outlet`: the mock's change detector misses a small repair).
 - **Spurious reuse flags: 2** (before photos of different jobs in a similar-looking room).
 
-With Claude: `python -m eval.run_eval --ai claude --write eval/results-claude.md` (needs `ANTHROPIC_API_KEY`).
-Not run yet in this branch.
+With Claude: not run yet; see [Eval results (real Claude)](#eval-results-real-claude).
 
 ## Deploy on Vercel
 
@@ -206,27 +306,15 @@ curl -s -H "X-Janus-Token: <CUSTOMER>" localhost:8000/api/t/<id>/reject -d '{"re
 curl -s -H "X-Janus-Token: <CUSTOMER>" localhost:8000/api/t/<id>/audit/verify
 ```
 
-The customer approves the hold with a form POST from the job page (`POST /t/<id>/pay`, bound to the terms hash).
+The customer approves the hold with a form POST from the job page (`POST /t/<id>/pay`, bound to the terms hash),
+and a new hold after a lapse with `POST /t/<id>/renew` (or `POST /api/t/<id>/renew`, which returns the approval URL).
+A job that captured part and voided the rest ends in state `partially_captured`.
 
 ## Threshold mode
 
 The earlier flow is still there: a seller states a condition about an item, the buyer photographs what arrived,
 and under the buyer's prior consent a confident verdict can capture or void automatically. Create one at
 `/threshold`, or `python -m janus demo`. See [docs/CONFIDENCE.md](docs/CONFIDENCE.md).
-
-## Tests
-
-```bash
-pytest -q                                                    # file and SQLite backends
-JANUS_TEST_DATABASE_URL=postgresql://... pytest -q           # also runs the Postgres backend tests
-```
-
-Some tests are Postgres-only and are skipped without `JANUS_TEST_DATABASE_URL`.
-
-## Docs
-
-[THREAT_MODEL](docs/THREAT_MODEL.md) · [ATTACKS](docs/ATTACKS.md) · [CONFIDENCE](docs/CONFIDENCE.md) ·
-[HARD_QUESTIONS](docs/HARD_QUESTIONS.md)
 
 ## Layout
 
