@@ -416,6 +416,9 @@ def make_handler(j: Janus):
                             return self._send(200, f.read_bytes(), ctype)
                 if parts[:2] == ["api", "t"] and len(parts) == 3 and ID.fullmatch(parts[2]):
                     return self._send(200, public(j.get(parts[2])))
+                if parts[:2] == ["api", "t"] and parts[3:] == ["packet"] and ID.fullmatch(parts[2]):
+                    from .packet import build
+                    return self._send(200, build(j.get(parts[2])), "text/markdown")
                 if parts == ["api", "thresholds"]:
                     return self._send(200, [{"id": t.id, "state": t.state.value, "title": t.listing.title,
                                              "amount": t.amount, "currency": t.currency} for t in j.store.all()])

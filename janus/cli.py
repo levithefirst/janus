@@ -128,6 +128,8 @@ def main(argv=None) -> int:
         s.add_argument(f"--{f}")
     s = sub.add_parser("show"); s.add_argument("id"); s.add_argument("--json", action="store_true")
     sub.add_parser("list")
+    s = sub.add_parser("packet", help="decision packet: AI reasoning per checklist item, flags, consents, PayPal")
+    s.add_argument("id")
     s = sub.add_parser("consent", help="record the buyer's consent to the condition (needed before pay)")
     s.add_argument("id")
     s = sub.add_parser("pay", help="create the PayPal order (intent=AUTHORIZE), print the buyer link")
@@ -166,6 +168,9 @@ def main(argv=None) -> int:
         elif a.cmd == "show":
             t = j.get(a.id)
             print(t.model_dump_json(indent=2) if a.json else summary(t))
+        elif a.cmd == "packet":
+            from .packet import build
+            print(build(j.get(a.id)))
         elif a.cmd == "list":
             for t in j.store.all():
                 print(f"{t.id}  {t.state.value:<18} {t.amount} {t.currency}  {t.listing.title}")
