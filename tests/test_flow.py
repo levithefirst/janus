@@ -96,6 +96,7 @@ def test_out_of_order_rejected(janus, step):
 
 def test_payment_and_authorize_are_idempotent(janus):
     t = new_threshold(janus)
+    janus.consent(t.id)
     o1 = janus.create_payment(t.id).payment.order_id
     assert janus.create_payment(t.id).payment.order_id == o1
     a1 = janus.authorize(t.id).payment.authorization_id
@@ -105,6 +106,7 @@ def test_payment_and_authorize_are_idempotent(janus):
 def test_authorize_adopts_existing_authorization(janus):
     """Crash after PayPal authorized but before we saved: the next call adopts it, no double hold."""
     t = new_threshold(janus)
+    janus.consent(t.id)
     janus.create_payment(t.id)
     t = janus.get(t.id)
     auth = janus.paypal.authorize_order(t.id, t.payment.order_id, f"janus-{t.id}-authorize")  # never recorded
@@ -115,6 +117,7 @@ def test_authorize_adopts_existing_authorization(janus):
 
 def test_not_approved_yet(janus, monkeypatch):
     t = new_threshold(janus)
+    janus.consent(t.id)
     janus.create_payment(t.id)
     monkeypatch.setattr(janus.paypal, "get_order", lambda *a: {"status": "PAYER_ACTION_REQUIRED"})
     with pytest.raises(JanusError, match="not approved"):
@@ -141,7 +144,7 @@ def test_refresh_and_sweep_detect_expiry(janus):
 def test_capture_rejected_as_expired(janus, monkeypatch):
     t = authorized(janus)
     janus.submit_and_verify(t.id, PHOTOS / "received_unclear.jpg")
-    monkeypatch.setattr(janus.paypal, "capture_authorization", lambda *a: (_ for _ in ()).throw(
+    monkeypatch.setattr(janus.paypal, "capture_authorization", lambda *a, **k: (_ for _ in ()).throw(
         PayPalError("x", 422, body={"details": [{"issue": "AUTHORIZATION_EXPIRED"}]})))
     assert janus.release(t.id).state == State.EXPIRED
 
@@ -152,7 +155,7 @@ def test_retryable_capture_failure_then_retry(janus, monkeypatch):
     t = authorized(janus)
     real = janus.paypal.capture_authorization
     monkeypatch.setattr(janus.paypal, "capture_authorization",
-                        lambda *a: (_ for _ in ()).throw(PayPalError("network down", None)))
+                        lambda *a, **k: (_ for _ in ()).throw(PayPalError("network down", None)))
     with pytest.raises(PayPalError):
         janus.submit_and_verify(t.id, PHOTOS / "received_match.jpg")
     t = janus.get(t.id)
@@ -176,7 +179,7 @@ def test_declined_capture_goes_to_hold(tmp_path):
 
 def test_capture_reconciles_when_already_captured(janus):
     t = authorized(janus)
-    janus.paypal.capture_authorization(t.id, t.payment.authorization_id, f"janus-{t.id}-capture")  # never recorded
+    janus.paypal.capture_authorization(t.id, t.payment.authorization_id, f"janus-{t.id}-capture-1")  # never recorded
     t = janus.submit_and_verify(t.id, PHOTOS / "received_match.jpg")
     assert t.state == State.CAPTURED and t.payment.capture_id  # replayed, not double-captured
 

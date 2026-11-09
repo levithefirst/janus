@@ -34,5 +34,6 @@ def new_threshold(j):
 
 def authorized(j):
     t = new_threshold(j)
+    j.consent(t.id, channel="api")
     j.create_payment(t.id)
     return j.authorize(t.id)

@@ -401,6 +401,10 @@ def make_handler(j: Janus):
                         t = self._view(tid)
                         return self._send(200, threshold_page(j, t, j.is_seller(t, q.get("k"))), "text/html")
                     if parts[2:] == ["pay"]:
+                        # The buyer clicked "Authorize with PayPal" on a page that states the condition and
+                        # says the payment is captured automatically when it is verified: explicit consent.
+                        if j.get(tid).state == State.CREATED:
+                            j.consent(tid, channel="web")
                         t = j.create_payment(tid)
                         if t.state != State.PAYMENT_PENDING or not t.payment.approve_url:
                             return self._redirect(f"/t/{tid}")
@@ -426,6 +430,9 @@ def make_handler(j: Janus):
                                         "seller_link": j.seller_link(t), "threshold": public(t)})
             if parts[:2] == ["api", "t"] and len(parts) == 4 and ID.fullmatch(parts[2]):
                 tid, action = parts[2], parts[3]
+                if action == "consent":
+                    return self._send(200, public(j.consent(tid, channel="api",
+                                                            evidence_from=b.get("evidence_from"))))
                 if action == "payment":
                     t = j.create_payment(tid)
                     return self._send(200, {"buyer_link": j.buyer_link(t), "approve_url": t.payment.approve_url,

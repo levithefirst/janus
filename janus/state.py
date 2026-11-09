@@ -3,6 +3,7 @@
 created -> payment_pending -> authorized -> evidence_submitted -> capturing -> captured
                                    |                |       \\-> voiding   -> voided
                                    |                \\-> held (more evidence, or a human decides)
+                                   |                \\-> disputed (customer objects; humans resolve)
                                    \\-> expired (authorization ran out before settlement)
 """
 from __future__ import annotations
@@ -16,6 +17,7 @@ class State(str, Enum):
     AUTHORIZED = "authorized"                  # funds held by PayPal, nothing captured
     EVIDENCE_SUBMITTED = "evidence_submitted"  # buyer sent a photo, verification pending
     HELD = "held"                              # verdict uncertain: more evidence or a human decision
+    DISPUTED = "disputed"                      # customer disputes: no automatic settlement until resolved
     CAPTURING = "capturing"                    # capture in flight (or failed retryably: retry it)
     VOIDING = "voiding"                        # void in flight (or failed retryably: retry it)
     CAPTURED = "captured"                      # terminal: seller paid
@@ -24,15 +26,20 @@ class State(str, Enum):
 
 
 TERMINAL = {State.CAPTURED, State.VOIDED, State.EXPIRED}
-HOLDS_FUNDS = {State.AUTHORIZED, State.EVIDENCE_SUBMITTED, State.HELD, State.CAPTURING, State.VOIDING}
+HOLDS_FUNDS = {State.AUTHORIZED, State.EVIDENCE_SUBMITTED, State.HELD, State.DISPUTED, State.CAPTURING,
+               State.VOIDING}
 
 ALLOWED: dict[State, set[State]] = {
     State.CREATED: {State.PAYMENT_PENDING},
     State.PAYMENT_PENDING: {State.AUTHORIZED},
     # The buyer may release (capture) or the seller refund (void) at any time while funds are held.
-    State.AUTHORIZED: {State.EVIDENCE_SUBMITTED, State.CAPTURING, State.VOIDING, State.EXPIRED},
-    State.EVIDENCE_SUBMITTED: {State.EVIDENCE_SUBMITTED, State.CAPTURING, State.VOIDING, State.HELD, State.EXPIRED},
-    State.HELD: {State.EVIDENCE_SUBMITTED, State.CAPTURING, State.VOIDING, State.EXPIRED},
+    State.AUTHORIZED: {State.EVIDENCE_SUBMITTED, State.CAPTURING, State.VOIDING, State.EXPIRED, State.DISPUTED},
+    State.EVIDENCE_SUBMITTED: {State.EVIDENCE_SUBMITTED, State.CAPTURING, State.VOIDING, State.HELD, State.EXPIRED,
+                               State.DISPUTED},
+    State.HELD: {State.EVIDENCE_SUBMITTED, State.CAPTURING, State.VOIDING, State.EXPIRED, State.DISPUTED},
+    # A dispute stops automatic settlement. It ends when the customer withdraws it (held) or releases
+    # (capture), the provider refunds (void), or the authorization nears expiry (void) or expires.
+    State.DISPUTED: {State.HELD, State.CAPTURING, State.VOIDING, State.EXPIRED},
     # A settlement can end somewhere other than planned when PayPal says the authorization
     # was already captured, voided or expired, or rejects the capture outright (-> held).
     State.CAPTURING: {State.CAPTURED, State.VOIDED, State.EXPIRED, State.HELD},

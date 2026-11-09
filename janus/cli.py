@@ -86,6 +86,7 @@ def demo(j: Janus, a) -> list[dict]:
         print(f"\n=================== scenario: {name} ===================")
         t = create_from_args(j, argparse.Namespace(listing=str(listing), price=None, condition=None))
         print(summary(t))
+        j.consent(t.id, channel="cli")  # the demo plays the buyer, who accepts the condition
         t = j.create_payment(t.id)
         print(f"\n  Buyer link:          {j.buyer_link(t)}")
         print(f"  PayPal approval URL: {t.payment.approve_url}")
@@ -127,6 +128,8 @@ def main(argv=None) -> int:
         s.add_argument(f"--{f}")
     s = sub.add_parser("show"); s.add_argument("id"); s.add_argument("--json", action="store_true")
     sub.add_parser("list")
+    s = sub.add_parser("consent", help="record the buyer's consent to the condition (needed before pay)")
+    s.add_argument("id")
     s = sub.add_parser("pay", help="create the PayPal order (intent=AUTHORIZE), print the buyer link")
     s.add_argument("id")
     s = sub.add_parser("authorize", help="authorize after the buyer approved on PayPal")
@@ -165,6 +168,9 @@ def main(argv=None) -> int:
         elif a.cmd == "list":
             for t in j.store.all():
                 print(f"{t.id}  {t.state.value:<18} {t.amount} {t.currency}  {t.listing.title}")
+        elif a.cmd == "consent":
+            t = j.consent(a.id, channel="cli")
+            print(f"Consent recorded for terms {t.consents[-1].terms_hash[:12]}")
         elif a.cmd == "pay":
             t = j.create_payment(a.id)
             print(f"Buyer link: {j.buyer_link(t)}\nPayPal approval URL: {t.payment.approve_url}")

@@ -16,6 +16,39 @@ from .models import CompiledCondition, EvidenceItem, Listing, Verdict
 from .state import TERMINAL, State
 
 
+class Consent(BaseModel):
+    """An explicit customer decision, bound to the exact terms it was given for."""
+    kind: str            # auto_capture_on_verified | release | amendment
+    by: str              # always the customer (buyer); recorded for the audit trail
+    at: str
+    terms_hash: str
+    amount: str
+    channel: str         # web | api | cli
+    evidence_from: list[str] = Field(default_factory=lambda: ["buyer"])  # whose evidence may auto-capture
+
+
+class Capture(BaseModel):
+    capture_id: str
+    amount: str
+    request_id: str
+    final: bool
+    items: list[str] = Field(default_factory=list)
+    at: str
+
+
+class Pending(BaseModel):
+    """A settlement written to disk BEFORE PayPal is called, so a crash can replay it exactly."""
+    action: str          # capture | void
+    by: str
+    reason: str
+    request_id: str
+    amount: Optional[str] = None
+    final: bool = True
+    items: list[str] = Field(default_factory=list)
+    verdict_index: Optional[int] = None   # which verdict justified an automatic capture
+    at: str
+
+
 class Payment(BaseModel):
     order_id: Optional[str] = None
     approve_url: Optional[str] = None
@@ -26,6 +59,11 @@ class Payment(BaseModel):
     capture_id: Optional[str] = None
     capture_status: Optional[str] = None
     voided: bool = False
+    captures: list[Capture] = Field(default_factory=list)
+    original_authorized_at: Optional[str] = None   # the 29-day clock starts here, reauthorize does not reset it
+    reauthorize_count: int = 0
+    honor_warned: bool = False
+    needs_new_authorization: bool = False
     last_error: Optional[str] = None
     checked_at: Optional[str] = None
 
@@ -36,6 +74,8 @@ class VerdictRecord(BaseModel):
     verdict: Verdict
     action: str          # capture | void | hold
     reason: str
+    min_confidence: float = 0.85          # the bar this verdict had to clear (base + evidence trust penalty)
+    evidence_by: str = "buyer"            # who submitted the evidence the verdict is about
 
 
 class Outcome(BaseModel):
@@ -59,6 +99,9 @@ class Threshold(BaseModel):
     evidence: list[EvidenceItem] = Field(default_factory=list)
     verdicts: list[VerdictRecord] = Field(default_factory=list)
     outcome: Optional[Outcome] = None
+    consents: list[Consent] = Field(default_factory=list)
+    pending: Optional[Pending] = None
+    ever_voided_or_expired: bool = False
     events: list[dict[str, Any]] = Field(default_factory=list)
 
     @property
