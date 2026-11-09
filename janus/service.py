@@ -22,7 +22,7 @@ from .logs import log_event, now, setup
 from .models import EvidenceItem, Listing
 from .clock import iso, parse, utcnow
 from .constants import AUTH_VALIDITY, HONOR_PERIOD
-from .paypal import PayPalError, PayPalMock, PayPalSandbox, auth_from_order
+from .paypal import PayPalError, make_request_id, PayPalMock, PayPalSandbox, auth_from_order
 from .policy import decide
 from .state import HOLDS_FUNDS, TERMINAL, State, TransitionError, check
 from .store import Outcome, Store, Threshold, VerdictRecord
@@ -324,11 +324,11 @@ class Janus:
             if status == "CAPTURED" and action == "void":
                 return done(State.CAPTURED, "The payment had already been captured; it cannot be voided.")
             if action == "capture":
-                cap = self.paypal.capture_authorization(t.id, p.authorization_id)
+                cap = self.paypal.capture_authorization(t.id, p.authorization_id, make_request_id(t.id, "capture"))
                 p.capture_id, p.capture_status, p.authorization_status = cap["capture_id"], cap["status"], "CAPTURED"
                 self._record(t, "paypal", "captured", capture_id=p.capture_id, status=p.capture_status)
                 return done(State.CAPTURED)
-            self.paypal.void_authorization(t.id, p.authorization_id)
+            self.paypal.void_authorization(t.id, p.authorization_id, make_request_id(t.id, "void"))
             p.voided, p.authorization_status = True, "VOIDED"
             self._record(t, "paypal", "voided", authorization_id=p.authorization_id)
             return done(State.VOIDED)

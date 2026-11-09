@@ -107,7 +107,7 @@ def test_authorize_adopts_existing_authorization(janus):
     t = new_threshold(janus)
     janus.create_payment(t.id)
     t = janus.get(t.id)
-    auth = janus.paypal.authorize_order(t.id, t.payment.order_id)  # happened, never recorded
+    auth = janus.paypal.authorize_order(t.id, t.payment.order_id, f"janus-{t.id}-authorize")  # never recorded
     t = janus.authorize(t.id)
     assert t.state == State.AUTHORIZED and t.payment.authorization_id == auth["authorization_id"]
     assert any(e["action"] == "authorization_adopted" for e in t.events)
@@ -176,13 +176,13 @@ def test_declined_capture_goes_to_hold(tmp_path):
 
 def test_capture_reconciles_when_already_captured(janus):
     t = authorized(janus)
-    janus.paypal.capture_authorization(t.id, t.payment.authorization_id)  # captured, never recorded
+    janus.paypal.capture_authorization(t.id, t.payment.authorization_id, f"janus-{t.id}-capture")  # never recorded
     t = janus.submit_and_verify(t.id, PHOTOS / "received_match.jpg")
     assert t.state == State.CAPTURED and t.payment.capture_id  # replayed, not double-captured
 
 
 def test_void_after_outside_capture_reports_captured(janus):
     t = authorized(janus)
-    janus.paypal.capture_authorization(t.id, t.payment.authorization_id)
+    janus.paypal.capture_authorization(t.id, t.payment.authorization_id, "someone-else")
     t = janus.submit_and_verify(t.id, PHOTOS / "received_mismatch.jpg")
     assert t.state == State.CAPTURED and t.outcome.by == "paypal"
