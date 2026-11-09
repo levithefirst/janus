@@ -76,8 +76,10 @@ Sources: [PayPal refunds](https://www.paypal.com/us/cshelp/article/how-do-i-issu
 ## 9. How does Janus handle partial work?
 
 Each checklist item can carry an amount. Janus captures only the items verified as met, leaves the rest held,
-and never captures the same item twice. Gaps: an itemized job cannot be amended yet, and whether PayPal lets
-us void the remainder after a partial capture is not stated in its docs (to be confirmed in Sandbox).
+and never captures the same item twice. Gap: an itemized job cannot be amended yet. Sandbox check (2026-11-09):
+PayPal does allow voiding the remainder after a partial capture. On authorization 8TJ27215PX638500B ($10.00),
+a $4.00 capture with final_capture false left status PARTIALLY_CAPTURED (capture 0CX971222E3797614,
+COMPLETED); a following void returned 200 and the authorization became VOIDED.
 
 ## 10. What does a job cost, and who pays?
 

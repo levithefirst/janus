@@ -38,7 +38,10 @@ REAUTHORIZE_EARLIEST = HONOR_PERIOD      # docs: reauthorize only after the 3-da
 # Void. Source: Payments v2 "Void authorized payment" (same links as above):
 #   "You cannot void an authorized payment that has been fully captured."
 # The docs do not say in words whether the remainder can be voided after a PARTIAL capture (final_capture
-# false). TODO(sandbox): confirm. Janus treats it as allowed but re-reads PayPal state before and after.
+# false). Measured in PayPal Sandbox (2026-11-09, Janus2 app): after a $4.00 partial capture on a $10.00
+# authorization (status PARTIALLY_CAPTURED), POST /v2/payments/authorizations/{id}/void returned 200 and
+# the authorization status became VOIDED. Capture id 0CX971222E3797614, authorization 8TJ27215PX638500B.
+# Janus treats void-after-partial as allowed and re-reads PayPal state before and after.
 
 # After capture (we do not act on these yet; recorded so the limits are in one place).
 # Refund: "You can send a full or partial refund within 180 days of the payment date."

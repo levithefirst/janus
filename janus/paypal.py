@@ -386,7 +386,7 @@ class PayPalMock:
         a = self._auth(db, authorization_id)
         if a["status"] == "VOIDED":
             self._fail("AUTHORIZATION_ALREADY_VOIDED")
-        if a["status"] not in ("CREATED", "PARTIALLY_CAPTURED"):  # TODO(sandbox): confirm void after partial
+        if a["status"] not in ("CREATED", "PARTIALLY_CAPTURED"):  # sandbox 2026-11-09: void after partial allowed
             self._fail({"EXPIRED": "AUTHORIZATION_EXPIRED"}.get(a["status"], "AUTHORIZATION_ALREADY_CAPTURED"))
         a["status"] = "VOIDED"
         log_event("paypal", "void", ref, mode="mock", authorization_id=authorization_id, request_id=request_id)
