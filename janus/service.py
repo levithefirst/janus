@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import hashlib
 import io
-import threading
 from contextlib import contextmanager
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -85,8 +84,6 @@ class Janus:
             PayPalSandbox(config.paypal_client_id, config.paypal_client_secret,
                           negative_test=config.paypal_negative_test)
             if config.paypal_mode == "sandbox" else PayPalMock(config.data_dir, config.paypal_negative_test))
-        self._locks: dict[str, threading.Lock] = {}
-        self._locks_guard = threading.Lock()
 
     @classmethod
     def from_env(cls) -> "Janus":
@@ -96,10 +93,8 @@ class Janus:
 
     @contextmanager
     def _locked(self, tid: str) -> Iterator[Threshold]:
-        """One mutation per threshold at a time (the HTTP server is threaded)."""
-        with self._locks_guard:
-            lock = self._locks.setdefault(tid, threading.Lock())
-        with lock:
+        """Load-modify-save under the threshold's lock; saves are compare-and-set on top."""
+        with self.store.lock(tid):
             yield self.store.load(tid)
 
     def _move(self, t: Threshold, target: State, **data) -> None:

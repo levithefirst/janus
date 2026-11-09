@@ -1,16 +1,19 @@
 """JSON-file store: one file per threshold at <data_dir>/thresholds/<id>/threshold.json."""
 from __future__ import annotations
 
+import fcntl
 import os
 import secrets
+import threading
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 from pydantic import BaseModel, Field
 
 from .logs import now
 from .models import CompiledCondition, EvidenceItem, Listing, Verdict
-from .state import State
+from .state import TERMINAL, State
 
 
 class Payment(BaseModel):
@@ -44,6 +47,7 @@ class Outcome(BaseModel):
 
 class Threshold(BaseModel):
     id: str
+    version: int = 0             # compare-and-set: bumped on every save
     seller_key: str
     state: State
     created_at: str
@@ -74,10 +78,20 @@ class NotFound(Exception):
     pass
 
 
+class ConflictError(Exception):
+    """Someone else saved this threshold since it was loaded (compare-and-set failed)."""
+
+
+class ImmutableError(Exception):
+    """The threshold is in a terminal state; nothing may change it."""
+
+
 class Store:
     def __init__(self, data_dir: Path):
         self.root = Path(data_dir) / "thresholds"
         self.root.mkdir(parents=True, exist_ok=True)
+        self._guard = threading.Lock()
+        self._tlocks: dict[str, threading.Lock] = {}
 
     @staticmethod
     def new_id() -> str:
@@ -90,11 +104,40 @@ class Store:
     def dir(self, tid: str) -> Path:
         return self.root / tid
 
+    @contextmanager
+    def lock(self, tid: str) -> Iterator[None]:
+        """Exclusive lock on one threshold, across threads and processes (CLI, server, scheduler)."""
+        d = self.dir(tid)
+        if not d.is_dir() or "/" in tid or ".." in tid:
+            raise NotFound(tid)
+        with self._guard:
+            tl = self._tlocks.setdefault(tid, threading.Lock())
+        with tl, (d / ".lock").open("a") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
+
+    def _disk_version(self, tid: str) -> tuple[int, Optional[State]]:
+        p = self.dir(tid) / "threshold.json"
+        if not p.is_file():
+            return 0, None
+        raw = Threshold.model_validate_json(p.read_text())
+        return raw.version, raw.state
+
     def save(self, t: Threshold) -> None:
+        """Compare-and-set write: fails if the file changed since `t` was loaded, or if it is terminal."""
+        disk_version, disk_state = self._disk_version(t.id)
+        if disk_state in TERMINAL:
+            raise ImmutableError(f"{t.id} is {disk_state.value}; terminal thresholds cannot change")
+        if disk_version != t.version:
+            raise ConflictError(f"{t.id} changed on disk (version {disk_version}, expected {t.version})")
+        t.version += 1
         t.updated_at = now()
         d = self.dir(t.id)
         d.mkdir(parents=True, exist_ok=True)
-        tmp = d / "threshold.json.tmp"
+        tmp = d / f"threshold.json.{os.getpid()}.{threading.get_ident()}.tmp"
         tmp.write_text(t.model_dump_json(indent=2))
         os.replace(tmp, d / "threshold.json")
 
