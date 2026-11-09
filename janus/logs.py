@@ -18,6 +18,13 @@ from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger("janus")
+
+# While a Janus operation runs on a job, every log record about that job is also appended to the job's
+# hash-chained audit trail (PayPal calls, AI requests and outputs, state changes). Set by Janus._locked.
+import contextvars  # noqa: E402
+
+audit_sink: contextvars.ContextVar = contextvars.ContextVar("janus_audit_sink", default=None)
+AUDITED_CATEGORIES = {"paypal", "ai", "state", "security", "scheduler"}
 _log_path: Path | None = None
 
 SENSITIVE_KEYS = {"note", "notes", "email", "payer", "payer_email", "name", "given_name", "surname", "address",
@@ -81,4 +88,7 @@ def log_event(category: str, action: str, ref: str | None = None, **data) -> dic
     if _log_path is not None:
         with _log_path.open("a") as f:
             f.write(json.dumps(record, default=str) + "\n")
+    sink = audit_sink.get()
+    if sink is not None and ref and category in AUDITED_CATEGORIES:
+        sink(record)
     return record

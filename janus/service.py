@@ -118,9 +118,24 @@ class Janus:
 
     @contextmanager
     def _locked(self, tid: str) -> Iterator[Threshold]:
-        """Load-modify-save under the threshold's lock; saves are compare-and-set on top."""
-        with self.store.lock(tid):
+        """Load-modify-save under the threshold's lock; saves are compare-and-set on top. While it runs,
+        log records about this job (PayPal calls, AI, state changes) also go to the job's audit chain."""
+        with self.store.lock(tid), self._auditing():
             yield self.store.load(tid)
+
+    @contextmanager
+    def _auditing(self) -> Iterator[None]:
+        from .logs import audit_sink
+
+        def sink(rec: dict) -> None:
+            data = {k: v for k, v in rec.items() if k not in ("ts", "category", "action", "threshold_id")}
+            self.audit.append(f"{rec['category']}.{rec['action']}", rec["threshold_id"], rec["category"],
+                              rec["action"], fields=data)
+        token = audit_sink.set(sink)
+        try:
+            yield
+        finally:
+            audit_sink.reset(token)
 
     def _move(self, t: Threshold, target: State, **data) -> None:
         check(t.state, target)
@@ -178,7 +193,8 @@ class Janus:
         tid = self.store.new_id()
         draft = Threshold.model_construct(id=tid)
         listing.photos = [self._ingest(draft, p, "listing", f"L{i}")[0] for i, p in enumerate(photos or [], 1)]
-        compiled = self.ai.compile_condition(condition, listing, self.store.dir(tid), ref=tid)
+        with self._auditing():
+            compiled = self.ai.compile_condition(condition, listing, self.store.dir(tid), ref=tid)
         t = Threshold(id=tid, tenant=tenant, state=State.CREATED, created_at=now(),
                       updated_at=now(), listing=listing, condition=condition, compiled=compiled)
         self._record(t, "ai", "condition_compiled", requirements=[f"{r.id}{'*' if r.critical else ''}"
@@ -708,6 +724,8 @@ class Janus:
         if action == "capture":
             try:
                 rules.check_capture(t, pend.by, self.config.min_confidence)
+                self._audit(t, "rule_check", "rules", "all hard rules passed before capture", result="pass",
+                            request_id=pend.request_id, amount=pend.amount, by=pend.by)
             except RuleViolation as v:
                 self._audit(t, "rule_blocked", pend.by, str(v), rule=v.rule, request_id=pend.request_id)
                 return self._hold(t, f"Blocked by rule {v.rule}: {v}", actor="rules")

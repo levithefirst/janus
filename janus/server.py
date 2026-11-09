@@ -572,13 +572,27 @@ def make_handler(j: Janus, limiter: Optional[RateLimiter] = None):
                     # record consent or create an order: that is the POST below.
                     return self._redirect(j.buyer_link(t))
                 raise NotFound(tid)
-            if parts[:2] == ["api", "t"] and len(parts) in (3, 4) and ID.fullmatch(parts[2]):
+            if parts[:2] == ["api", "t"] and len(parts) in (3, 4, 5) and ID.fullmatch(parts[2]):
                 t, _ = self._need(parts[2], READ_ROLES, cred)
                 if len(parts) == 3:
                     return self._send(200, public(t))
-                if parts[3] == "packet":
+                if parts[3:] == ["packet"]:
                     from .packet import build
                     return self._send(200, build(t), "text/markdown")
+                if parts[3:] == ["audit"]:
+                    after = int(q.get("after", "0") or 0) if (q.get("after") or "0").isdigit() else 0
+                    entries = j.audit.entries(t.id)
+                    ok, msg = j.audit.verify(t.id)
+                    return self._send(200, {"threshold_id": t.id, "verified": ok, "message": msg,
+                                            "head": entries[-1]["hash"] if entries else None,
+                                            "count": len(entries), "entries": entries[after:]})
+                if parts[3:] == ["audit", "verify"]:
+                    entries = j.audit.entries(t.id)
+                    ok, msg = j.audit.verify(t.id)
+                    return self._send(200, {"threshold_id": t.id, "verified": ok, "message": msg,
+                                            "count": len(entries), "head": entries[-1]["hash"] if entries else None,
+                                            "algorithm": "sha256 over the canonical JSON of each entry without "
+                                                         "'hash'; 'prev' is the previous entry's hash"})
                 raise NotFound(t.id)
             if parts == ["api", "thresholds"]:
                 tenant = j.security.tenant_of_key(cred)
