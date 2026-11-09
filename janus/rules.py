@@ -36,7 +36,7 @@ class RuleViolation(Exception):
 def terms_hash(t: "Threshold") -> str:
     terms = {"condition": t.condition, "price": t.listing.price, "currency": t.listing.currency,
              "requirements": [(r.id, r.statement, r.critical) for r in t.compiled.requirements],
-             "allocations": dict(sorted(getattr(t, "allocations", {}).items()))}
+             "allocations": dict(sorted(t.allocations.items()))}
     return hashlib.sha256(json.dumps(terms, sort_keys=True).encode()).hexdigest()
 
 
@@ -75,7 +75,7 @@ def check_capture(t: "Threshold", by: str, min_confidence_floor: float) -> None:
     # automatic capture
     if t.state == State.DISPUTED:
         raise RuleViolation("dispute_open", "a dispute is open")
-    if getattr(t, "amendment", None) is not None:
+    if t.amendment is not None:
         raise RuleViolation("amendment_pending", "an amendment is waiting for the customer's consent")
     consent = valid_consent(t, ("auto_capture_on_verified", "amendment"))
     if not consent:
@@ -85,9 +85,18 @@ def check_capture(t: "Threshold", by: str, min_confidence_floor: float) -> None:
         raise RuleViolation("confidence", "an automatic capture must point at the verdict that justified it")
     rec = t.verdicts[pend.verdict_index]
     bar = max(min_confidence_floor, rec.min_confidence)
-    if rec.verdict.confidence < bar:
+    if not pend.items and rec.verdict.confidence < bar:
         raise RuleViolation("confidence", f"confidence {rec.verdict.confidence:.2f} is below {bar:.2f}")
     if rec.action != "capture":
         raise RuleViolation("confidence", f"the verdict's decision was {rec.action}, not capture")
+    if pend.items:  # itemized capture: every captured item must itself be met with confidence
+        checks = {c.requirement_id: c for c in rec.verdict.checks}
+        for rid in pend.items:
+            c = checks.get(rid)
+            conf = c.confidence if c is not None and c.confidence is not None else rec.verdict.confidence
+            if c is None or c.result != "met" or conf < bar:
+                raise RuleViolation("confidence", f"item {rid} was not verified as met with confidence >= {bar:.2f}")
+            if t.item_status.get(rid) != "pending":
+                raise RuleViolation("double_capture", f"item {rid} is already {t.item_status.get(rid)}")
     if rec.evidence_by not in consent.evidence_from:
         raise RuleViolation("consent", f"the customer did not agree to auto-capture on evidence from {rec.evidence_by}")

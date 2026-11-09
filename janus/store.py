@@ -49,8 +49,18 @@ class Pending(BaseModel):
     at: str
 
 
+class Amendment(BaseModel):
+    """A change of scope proposed by the provider. Nothing changes until the customer accepts it."""
+    condition: Optional[str] = None
+    price: Optional[str] = None
+    reason: str = ""
+    proposed_by: str = "seller"
+    at: str
+
+
 class Payment(BaseModel):
     order_id: Optional[str] = None
+    authorized_amount: Optional[str] = None
     approve_url: Optional[str] = None
     authorization_id: Optional[str] = None
     authorization_status: Optional[str] = None   # last status PayPal reported
@@ -106,6 +116,9 @@ class Threshold(BaseModel):
     pending: Optional[Pending] = None
     ever_voided_or_expired: bool = False
     delivery_location: Optional[list[float]] = None   # optional [lat, lon] for the GPS check
+    allocations: dict[str, str] = Field(default_factory=dict)  # requirement id -> amount (itemized capture)
+    item_status: dict[str, str] = Field(default_factory=dict)  # requirement id -> pending|captured|released
+    amendment: Optional[Amendment] = None
     events: list[dict[str, Any]] = Field(default_factory=list)
 
     @property

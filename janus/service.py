@@ -27,10 +27,10 @@ from .clock import iso, parse, utcnow
 from .constants import (AUTH_VALIDITY, HONOR_PERIOD, REAUTHORIZE_ATTEMPTS_ALLOWED, REAUTHORIZE_MAX_COUNT,
                         VOID_BEFORE_EXPIRY, WARN_BEFORE_HONOR)
 from .paypal import PayPalError, make_request_id, PayPalMock, PayPalSandbox, auth_from_order
-from .policy import Decision, decide
+from .policy import Decision, decide, decide_items
 from .state import HOLDS_FUNDS, TERMINAL, State, TransitionError, check
 from .rules import RuleViolation
-from .store import Capture, Consent, Outcome, Pending, Store, Threshold, VerdictRecord
+from .store import Amendment, Capture, Consent, Outcome, Pending, Store, Threshold, VerdictRecord
 
 ImageInput = Union[str, Path, bytes]
 MAX_IMAGE_BYTES = 12 * 1024 * 1024
@@ -170,6 +170,77 @@ class Janus:
                     requirements=[r.model_dump() for r in compiled.requirements], terms_hash=rules.terms_hash(t))
         return t
 
+    # --- itemized pricing and scope amendments (provider proposes, customer consents) ---
+
+    def set_allocations(self, tid: str, allocations: dict[str, str]) -> Threshold:
+        """Split the price across checklist items so each can be captured on its own. Before payment only."""
+        with self._locked(tid) as t:
+            if t.state != State.CREATED:
+                raise TransitionError("allocations are part of the terms: set them before the customer pays")
+            ids = {r.id for r in t.compiled.requirements}
+            if set(allocations) != ids:
+                raise JanusError(f"allocate every checklist item exactly once: {sorted(ids)}")
+            amounts = {k: _money(v) for k, v in allocations.items()}
+            if sum(Decimal(v) for v in amounts.values()) != Decimal(t.amount):
+                raise JanusError(f"allocations must add up to the price {t.amount}")
+            t.allocations, t.item_status = amounts, {k: "pending" for k in amounts}
+            self.store.save(t)
+            self._audit(t, "allocations_set", "seller", "price split per checklist item", allocations=amounts,
+                        terms_hash=rules.terms_hash(t))
+            return t
+
+    def propose_amendment(self, tid: str, condition: Optional[str] = None, price: Optional[str] = None,
+                          reason: str = "") -> Threshold:
+        with self._locked(tid) as t:
+            rules.check_not_terminal(t)
+            if t.state in (State.CAPTURING, State.VOIDING):
+                raise TransitionError("a settlement is in progress")
+            if t.allocations:
+                raise JanusError("itemized thresholds cannot be amended yet (open item)")
+            if condition is None and price is None:
+                raise JanusError("an amendment changes the condition, the price, or both")
+            new_price = _money(price) if price is not None else None
+            if new_price and t.payment.authorized_amount and Decimal(new_price) > Decimal(t.payment.authorized_amount):
+                raise JanusError(f"{new_price} is more than the {t.payment.authorized_amount} the customer "
+                                 "authorized; that needs a new authorization")
+            if new_price and Decimal(new_price) < self._captured_total(t):
+                raise JanusError("the new price is below what has already been captured")
+            t.amendment = Amendment(condition=(condition or "").strip() or None, price=new_price,
+                                    reason=reason[:500], at=now())
+            self.store.save(t)
+            self._audit(t, "amendment_proposed", "seller", reason or "scope change proposed",
+                        condition=t.amendment.condition, price=new_price)
+            return t
+
+    def accept_amendment(self, tid: str, channel: str = "web") -> Threshold:
+        with self._locked(tid) as t:
+            rules.check_not_terminal(t)
+            a = t.amendment
+            if a is None:
+                raise JanusError("no amendment is waiting")
+            if a.condition:
+                t.condition = a.condition
+                t.compiled = self.ai.compile_condition(a.condition, t.listing, self.store.dir(t.id), ref=t.id)
+            if a.price:
+                t.listing.price = a.price
+            t.amendment = None
+            c = Consent(kind="amendment", by="buyer", at=now(), terms_hash=rules.terms_hash(t), amount=t.amount,
+                        channel=channel)
+            t.consents.append(c)
+            self.store.save(t)
+            self._audit(t, "amendment_accepted", "buyer", "customer consented to the amended terms",
+                        terms_hash=c.terms_hash, amount=t.amount, condition=t.condition)
+            return t
+
+    def reject_amendment(self, tid: str) -> Threshold:
+        with self._locked(tid) as t:
+            if t.amendment is None:
+                raise JanusError("no amendment is waiting")
+            t.amendment = None
+            self.store.save(t)
+            self._audit(t, "amendment_rejected", "buyer", "customer kept the original terms")
+            return t
+
     # --- explicit customer consent ---
 
     def consent(self, tid: str, channel: str = "web", evidence_from: Optional[list[str]] = None) -> Threshold:
@@ -225,6 +296,7 @@ class Janus:
             p.authorization_id, p.authorization_status = auth["authorization_id"], auth["status"]
             p.authorized_at = now()
             p.original_authorized_at = p.original_authorized_at or p.authorized_at
+            p.authorized_amount = t.amount
             p.expiration_time = auth.get("expiration_time") or iso(utcnow() + AUTH_VALIDITY)
             self._record(t, "paypal", "authorized", authorization_id=p.authorization_id,
                          status=p.authorization_status, expiration_time=p.expiration_time)
@@ -297,11 +369,26 @@ class Janus:
                 return self._gate_hold(t, "integrity", trust.hold_reasons, bar, trust, evidence_by,
                                        "A person needs to review this evidence before any money moves.")
             verdict = self.ai.verify(t.compiled, t.listing, t.evidence, self.store.dir(t.id), ref=t.id)
-            decision = decide(verdict, t.compiled, bar)
             consent = rules.valid_consent(t, ("auto_capture_on_verified", "amendment"))
-            if decision.action == "capture" and (consent is None or evidence_by not in consent.evidence_from):
-                decision = Decision("hold", f"condition verified on {evidence_by} evidence; waiting for the "
-                                            "customer to confirm (a silent customer never triggers a capture)")
+            may_capture = consent is not None and evidence_by in consent.evidence_from
+            wait = (f"verified on {evidence_by} evidence; waiting for the customer to confirm "
+                    "(a silent customer never triggers a capture)")
+            items = None
+            if t.allocations:
+                pending = [r for r, st in t.item_status.items() if st == "pending"]
+                items = decide_items(verdict, pending, bar)
+                cap = items.capture if may_capture else []
+                rest = [r for r in pending if r not in cap and r not in items.release]
+                if cap:
+                    decision = Decision("capture", items.reason)
+                elif items.release and not rest:
+                    decision = Decision("void", items.reason)
+                else:
+                    decision = Decision("hold", items.reason if may_capture or not items.capture else wait)
+            else:
+                decision = decide(verdict, t.compiled, bar)
+                if decision.action == "capture" and not may_capture:
+                    decision = Decision("hold", f"condition {wait}")
             rec = VerdictRecord(at=now(), evidence_ids=[e.id for e in t.evidence], verdict=verdict,
                                 action=decision.action, reason=decision.reason, min_confidence=bar,
                                 evidence_by=evidence_by, trust_flags=trust.flags)
@@ -313,10 +400,22 @@ class Janus:
                         confidence=verdict.confidence, min_confidence=bar, decision=decision.action,
                         trust_flags=trust.flags, evidence_by=evidence_by,
                         checks={c.requirement_id: [c.result, c.observation] for c in verdict.checks})
-            if decision.action == "hold":
+            if decision.action == "hold" and items is None:
                 self._move(t, State.HELD, reason=decision.reason)
                 return t
             reason = f"{verdict.summary} ({decision.reason})"
+            if items is not None:
+                for rid in items.release:
+                    t.item_status[rid] = "released"
+                if decision.action == "capture":
+                    cap = items.capture
+                    remaining = [r for r, st in t.item_status.items() if st == "pending" and r not in cap]
+                    amount = str(sum(Decimal(t.allocations[r]) for r in cap))
+                    return self._start(t, "capture", "janus", reason, amount=amount, final=not remaining,
+                                       items=tuple(cap), verdict_index=len(t.verdicts) - 1)
+                if decision.action == "hold":
+                    self._move(t, State.HELD, reason=decision.reason)
+                    return t
             if decision.action == "capture":
                 return self._start(t, "capture", "janus", reason, verdict_index=len(t.verdicts) - 1)
             return self._start(t, "void", "janus", reason)
@@ -351,6 +450,11 @@ class Janus:
                                       amount=t.amount, channel=channel))
             self._audit(t, "consent", "buyer", "customer released the payment", consent_kind="release",
                         channel=channel)
+            pending = [r for r, st in t.item_status.items() if st == "pending"]
+            if t.allocations:
+                amount = str(sum(Decimal(t.allocations[r]) for r in pending))
+                return self._start(t, "capture", "buyer", note or "Buyer released the payment", amount=amount,
+                                   items=tuple(pending))
             return self._start(t, "capture", "buyer", note or "Buyer released the payment")
 
     def refund(self, tid: str, note: str = "") -> Threshold:
@@ -584,6 +688,8 @@ class Janus:
                     p.captures.append(Capture(capture_id=cap["capture_id"], amount=cap.get("amount") or pend.amount,
                                               request_id=pend.request_id, final=pend.final, items=pend.items,
                                               at=now()))
+                for rid in pend.items:
+                    t.item_status[rid] = "captured"
                 p.capture_id, p.capture_status = cap["capture_id"], cap["status"]
                 p.authorization_status = "CAPTURED" if pend.final else "PARTIALLY_CAPTURED"
                 self._record(t, "paypal", "captured", capture_id=p.capture_id, amount=pend.amount, final=pend.final)

@@ -28,6 +28,8 @@ class RequirementCheck(BaseModel):
     requirement_id: str
     result: Literal["met", "not_met", "cannot_tell"]
     observation: str = Field(description="What the evidence actually shows for this requirement")
+    confidence: Optional[float] = Field(default=None, description="Probability 0.0 to 1.0 that this "
+                                        "requirement's result is correct")
 
 
 class Verdict(BaseModel):

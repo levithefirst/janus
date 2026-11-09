@@ -43,3 +43,35 @@ def decide(verdict: Verdict, condition: CompiledCondition, min_confidence: float
     if not failed:
         return Decision("hold", "verdict 'not_met' but no critical requirement was shown to fail")
     return Decision("void", f"critical requirement(s) {', '.join(failed)} not met (confidence {conf:.2f})")
+
+
+@dataclass(frozen=True)
+class ItemDecision:
+    capture: list[str]
+    release: list[str]
+    hold: list[str]
+    reason: str
+
+
+def decide_items(verdict: Verdict, pending: list[str], min_confidence: float = DEFAULT_MIN_CONFIDENCE) -> ItemDecision:
+    """Per checklist item: capture what is met with confidence, release what clearly failed, hold the rest.
+
+    Each item uses its own confidence when the verifier gave one, else the overall confidence.
+    An overall 'uncertain' verdict still lets confidently judged items settle on their own.
+    """
+    checks = {c.requirement_id: c for c in verdict.checks}
+    cap, rel, hold = [], [], []
+    for rid in pending:
+        c = checks.get(rid)
+        if c is None:
+            hold.append(rid)
+            continue
+        conf = max(0.0, min(1.0, float(c.confidence if c.confidence is not None else verdict.confidence)))
+        if c.result == "met" and conf >= min_confidence:
+            cap.append(rid)
+        elif c.result == "not_met" and conf >= min_confidence:
+            rel.append(rid)
+        else:
+            hold.append(rid)
+    parts = [f"{label}: {', '.join(ids)}" for label, ids in (("capture", cap), ("release", rel), ("hold", hold)) if ids]
+    return ItemDecision(cap, rel, hold, "; ".join(parts) or "nothing pending")
