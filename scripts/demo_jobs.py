@@ -25,15 +25,18 @@ from janus import clock  # noqa: E402
 from janus.cli import wait_authorize  # noqa: E402
 from janus.service import Janus, OverrideRequired  # noqa: E402
 
-DESC = "Patch the hole in the {room} wall. Sand it smooth. Paint the patch to match the wall."
+# Says only what the generated photos show: the wall colour, a hole in the middle of the wall between the
+# window and the door, and nothing else (no light switch, socket or skirting work).
+DESC = ("Patch the hole in the middle of the {colour} {room} wall, between the window and the door. "
+        "Sand it smooth. Paint the patch to match the {colour} wall.")
 
 
 def say(msg: str) -> None:
     print(msg, flush=True)
 
 
-def new_job(j: Janus, title: str, price: str, wait: int, room: str):
-    t = j.create_job(title, price, DESC.format(room=room))
+def new_job(j: Janus, title: str, price: str, wait: int, room: str, colour: str):
+    t = j.create_job(title, price, DESC.format(room=room, colour=colour))
     say(f"  job {t.id}: {title}, {t.amount} {t.currency}")
     for r in t.compiled.requirements:
         say(f"    checklist {r.id}: {r.statement}")
@@ -76,7 +79,7 @@ def main(argv=None) -> int:
     after1 = jpeg(draw(ROOMS["sage"], "hole", True, seed=2, layout=3, shift=12, light=1.05), taken=now)
 
     say("\nRun 1: good job, partial capture, void of the rest")
-    t = new_job(j, "Patch a hole in the living room wall", "120.00", args.wait, "living room")
+    t = new_job(j, "Patch a hole in the living room wall", "120.00", args.wait, "living room", ROOMS["sage"].colour)
     j.submit_evidence(t.id, before1, by="seller", phase="before")
     j.submit_evidence(t.id, after1, by="seller", phase="after")
     t = j.verify(t.id)
@@ -86,7 +89,7 @@ def main(argv=None) -> int:
     finish(j, t)
 
     say("\nRun 2: reused photo, flagged, rule blocks, customer rejects, void")
-    t = new_job(j, "Patch a hole in the hallway wall", "90.00", args.wait, "hallway")
+    t = new_job(j, "Patch a hole in the hallway wall", "90.00", args.wait, "hallway", ROOMS["blue"].colour)
     before2 = jpeg(draw(ROOMS["blue"], "hole", False, seed=11, layout=13), taken=now - timedelta(hours=1))
     j.submit_evidence(t.id, before2, by="seller", phase="before")
     j.submit_evidence(t.id, after1, by="seller", phase="after")  # run 1's after photo, reused

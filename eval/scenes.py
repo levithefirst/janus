@@ -21,14 +21,15 @@ class Room:
     wall: tuple[int, int, int]
     floor: tuple[int, int, int]
     window_left: bool
+    colour: str = ""                       # how a person would name the wall colour, for job descriptions
     trim: tuple[int, int, int] = (238, 236, 230)
 
 
 ROOMS = {
-    "sage": Room(wall=(150, 172, 140), floor=(120, 86, 58), window_left=True),
-    "blue": Room(wall=(110, 140, 185), floor=(170, 160, 150), window_left=False),
-    "terracotta": Room(wall=(196, 120, 90), floor=(70, 66, 64), window_left=True),
-    "yellow": Room(wall=(225, 200, 110), floor=(140, 100, 70), window_left=False),
+    "sage": Room(wall=(150, 172, 140), floor=(120, 86, 58), window_left=True, colour="sage green"),
+    "blue": Room(wall=(110, 140, 185), floor=(170, 160, 150), window_left=False, colour="blue"),
+    "terracotta": Room(wall=(196, 120, 90), floor=(70, 66, 64), window_left=True, colour="terracotta"),
+    "yellow": Room(wall=(225, 200, 110), floor=(140, 100, 70), window_left=False, colour="yellow"),
 }
 
 
@@ -65,7 +66,9 @@ def draw(room: Room, job: str, done: bool, seed: int = 0, shift: int = 0, light:
                 a = (cx + rnd.randint(-80, 80), cy + rnd.randint(-60, 60))
                 d.line([a, (a[0] + rnd.randint(-90, 90), a[1] + rnd.randint(-70, 70))], fill=(70, 60, 50), width=3)
         else:
-            d.ellipse([cx - 95, cy - 80, cx + 95, cy + 85], fill=tuple(min(255, c + 8) for c in room.wall))
+            # A repair done right: filled, sanded and painted to match, so it blends into the wall. (A lighter
+            # oval here reads, correctly, as a paint mismatch to a vision model.)
+            d.ellipse([cx - 95, cy - 80, cx + 95, cy + 85], fill=room.wall)
     elif job == "shelf":
         if done:
             d.rectangle([cx - 200, cy, cx + 200, cy + 22], fill=(110, 75, 45))
