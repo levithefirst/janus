@@ -50,7 +50,12 @@ class Listing(BaseModel):
 
 class EvidenceItem(BaseModel):
     id: str = ""                        # assigned on submit: V1, V2, ...
-    note: str = ""
+    by: Literal["buyer", "seller"] = "buyer"   # customer, or provider re-uploading
+    note: str = ""                      # sanitised; untrusted data
+    quality: dict = Field(default_factory=dict)  # width, height, sharpness, brightness, ok, reasons
+    exif: dict = Field(default_factory=dict)     # present, taken_at, offset, gps (rounded to ~100 m)
+    phash: Optional[str] = None
+    flags: list[str] = Field(default_factory=list)
     file: Optional[str] = None          # path inside the threshold's data dir
     media_type: Optional[str] = None
     sha256: Optional[str] = None

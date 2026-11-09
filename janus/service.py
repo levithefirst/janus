@@ -21,12 +21,13 @@ from .ai import ClaudeAI, MockAI
 from .audit import AuditLog
 from .config import Config
 from .logs import log_event, now, setup
-from .models import EvidenceItem, Listing
+from . import evidence as ev
+from .models import EvidenceItem, Listing, RequirementCheck, Verdict
 from .clock import iso, parse, utcnow
 from .constants import (AUTH_VALIDITY, HONOR_PERIOD, REAUTHORIZE_ATTEMPTS_ALLOWED, REAUTHORIZE_MAX_COUNT,
                         VOID_BEFORE_EXPIRY, WARN_BEFORE_HONOR)
 from .paypal import PayPalError, make_request_id, PayPalMock, PayPalSandbox, auth_from_order
-from .policy import decide
+from .policy import Decision, decide
 from .state import HOLDS_FUNDS, TERMINAL, State, TransitionError, check
 from .rules import RuleViolation
 from .store import Capture, Consent, Outcome, Pending, Store, Threshold, VerdictRecord
@@ -84,6 +85,7 @@ class Janus:
         setup(config.data_dir)
         self.store = Store(config.data_dir)
         self.audit = AuditLog(config.data_dir)
+        self.phash_index = ev.PhashIndex(config.data_dir)
         from .webhooks import Inbox
         self.inbox = Inbox(config.data_dir)
         self.ai = ai or (ClaudeAI(config.model) if config.ai_mode == "claude" else MockAI())
@@ -233,17 +235,47 @@ class Janus:
 
     # --- 4: buyer submits evidence ---
 
-    def submit_evidence(self, tid: str, photo: Optional[ImageInput] = None, note: str = "") -> Threshold:
+    def submit_evidence(self, tid: str, photo: Optional[ImageInput] = None, note: str = "",
+                        by: str = "buyer") -> Threshold:
+        """The customer (or, on re-upload, the provider) submits a photo. Integrity checks run on the
+        original bytes before the photo is re-encoded."""
+        if by not in ("buyer", "seller"):
+            raise JanusError("evidence comes from the buyer or the seller")
         with self._locked(tid) as t:
-            check(t.state, State.EVIDENCE_SUBMITTED)
-            if photo is None and not note.strip():
-                raise JanusError("send a photo of the item you received")
-            item = EvidenceItem(id=f"V{len(t.evidence) + 1}", note=note.strip()[:1000], submitted_at=now())
+            rules.check_not_terminal(t)
+            in_dispute = t.state == State.DISPUTED
+            if in_dispute and by != "seller":
+                raise TransitionError("during a dispute only the provider adds evidence; withdraw the dispute first")
+            if not in_dispute:
+                check(t.state, State.EVIDENCE_SUBMITTED)
+            clean = ev.sanitize_note(note)
+            if photo is None and not clean:
+                raise JanusError("send a photo of the item")
+            item = EvidenceItem(id=f"V{len(t.evidence) + 1}", by=by, note=clean, submitted_at=now(),
+                                flags=ev.note_flags(clean))
             if photo is not None:
-                item.file, item.media_type, item.sha256 = self._ingest(t, photo, "evidence", item.id)
+                raw = Path(photo).read_bytes() if isinstance(photo, (str, Path)) else photo
+                normalize_image(raw)  # validates the type and size before any analysis
+                info = ev.analyze(raw)
+                item.quality = {k: info[k] for k in ("width", "height", "sharpness", "brightness")} | {
+                    "ok": info["quality_ok"], "reasons": info["quality_reasons"]}
+                item.exif, item.phash = info["exif"], info["phash"]
+                item.file, item.media_type, item.sha256 = self._ingest(t, raw, "evidence", item.id)
+                for hit in self.phash_index.add_and_match(t.id, item.id, item.phash):
+                    item.flags.append(f"reused_photo:{hit['threshold_id']}/{hit['evidence_id']}")
+                for lp in t.listing.photos:
+                    lh = ev.phash_of_file(self.store.dir(t.id) / lp)
+                    if lh and ev.hamming(lh, item.phash) <= ev.REUSE_MAX_DISTANCE:
+                        item.flags.append("matches_listing_photo")
             t.evidence.append(item)
-            self._record(t, "state", "evidence_added", evidence_id=item.id, has_photo=bool(item.file))
-            self._move(t, State.EVIDENCE_SUBMITTED, total_evidence=len(t.evidence))
+            self._record(t, "state", "evidence_added", evidence_id=item.id, by=by, has_photo=bool(item.file),
+                         flags=item.flags, quality_ok=item.quality.get("ok"))
+            self._audit(t, "evidence_added", by, f"evidence {item.id} submitted", evidence_id=item.id,
+                        flags=item.flags, quality=item.quality, exif_present=bool(item.exif.get("present")))
+            if in_dispute:
+                self.store.save(t)
+            else:
+                self._move(t, State.EVIDENCE_SUBMITTED, total_evidence=len(t.evidence))
             return t
 
     # --- 5 + 6: AI verdict -> policy -> PayPal ---
@@ -254,17 +286,32 @@ class Janus:
                 raise TransitionError(f"verify needs new evidence first (state is '{t.state.value}')")
             if self._expired_now(t):
                 return t
+            newest = next((e for e in reversed(t.evidence) if e.file), None)
+            evidence_by = t.evidence[-1].by if t.evidence else "buyer"
+            trust = ev.assess(t.evidence, t.payment.authorized_at, t.delivery_location)
+            bar = trust.bar(self.config.min_confidence)
+            if newest is not None and not newest.quality.get("ok", True):
+                return self._gate_hold(t, "quality_gate", newest.quality.get("reasons", []), bar, trust, evidence_by,
+                                       "Retake the photo in good light, in focus, with the whole item in frame.")
+            if trust.hold_reasons:
+                return self._gate_hold(t, "integrity", trust.hold_reasons, bar, trust, evidence_by,
+                                       "A person needs to review this evidence before any money moves.")
             verdict = self.ai.verify(t.compiled, t.listing, t.evidence, self.store.dir(t.id), ref=t.id)
-            bar = self.config.min_confidence
             decision = decide(verdict, t.compiled, bar)
+            consent = rules.valid_consent(t, ("auto_capture_on_verified", "amendment"))
+            if decision.action == "capture" and (consent is None or evidence_by not in consent.evidence_from):
+                decision = Decision("hold", f"condition verified on {evidence_by} evidence; waiting for the "
+                                            "customer to confirm (a silent customer never triggers a capture)")
             rec = VerdictRecord(at=now(), evidence_ids=[e.id for e in t.evidence], verdict=verdict,
-                                action=decision.action, reason=decision.reason, min_confidence=bar)
+                                action=decision.action, reason=decision.reason, min_confidence=bar,
+                                evidence_by=evidence_by, trust_flags=trust.flags)
             t.verdicts.append(rec)
             self._record(t, "ai", "verdict", verdict=verdict.verdict, confidence=verdict.confidence,
-                         decision=decision.action, reason=decision.reason,
+                         decision=decision.action, reason=decision.reason, bar=bar, flags=trust.flags,
                          checks={c.requirement_id: c.result for c in verdict.checks})
             self._audit(t, "verdict", "janus", decision.reason, verdict=verdict.verdict,
                         confidence=verdict.confidence, min_confidence=bar, decision=decision.action,
+                        trust_flags=trust.flags, evidence_by=evidence_by,
                         checks={c.requirement_id: [c.result, c.observation] for c in verdict.checks})
             if decision.action == "hold":
                 self._move(t, State.HELD, reason=decision.reason)
@@ -274,8 +321,24 @@ class Janus:
                 return self._start(t, "capture", "janus", reason, verdict_index=len(t.verdicts) - 1)
             return self._start(t, "void", "janus", reason)
 
-    def submit_and_verify(self, tid: str, photo: Optional[ImageInput], note: str = "") -> Threshold:
-        self.submit_evidence(tid, photo, note)
+    def _gate_hold(self, t: Threshold, source: str, reasons: list[str], bar: float, trust, evidence_by: str,
+                   next_step: str) -> Threshold:
+        """Hold without asking the AI: the evidence itself is not fit to decide on."""
+        why = "; ".join(reasons)
+        verdict = Verdict(verdict="uncertain", confidence=0.0, summary=f"Janus did not judge this evidence: {why}.",
+                          next_step=next_step, checks=[RequirementCheck(requirement_id=r.id, result="cannot_tell",
+                                                                        observation=f"not assessed ({source})")
+                                                       for r in t.compiled.requirements])
+        t.verdicts.append(VerdictRecord(at=now(), evidence_ids=[e.id for e in t.evidence], verdict=verdict,
+                                        action="hold", reason=f"{source}: {why}", min_confidence=bar,
+                                        evidence_by=evidence_by, source=source, trust_flags=trust.flags))
+        self._audit(t, "verdict", source, why, decision="hold", trust_flags=trust.flags)
+        self._move(t, State.HELD, reason=f"{source}: {why}")
+        return t
+
+    def submit_and_verify(self, tid: str, photo: Optional[ImageInput], note: str = "",
+                          by: str = "buyer") -> Threshold:
+        self.submit_evidence(tid, photo, note, by=by)
         return self.verify(tid)
 
     # --- human decisions (only while funds are held) ---

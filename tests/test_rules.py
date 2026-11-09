@@ -1,7 +1,7 @@
 """Hard rules: each one is attacked directly, including with a policy that has been broken on purpose."""
 import pytest
 
-from conftest import PHOTOS, authorized, make_config, new_threshold
+from conftest import PHOTOS, authorized, make_config, new_threshold, with_exif
 from janus import rules
 from janus.ai import MockAI
 from janus.models import RequirementCheck, Verdict
@@ -47,9 +47,8 @@ def test_capture_blocked_when_consent_is_for_other_terms(janus):
         x.condition = "Pay if the seller says so"
         janus.store.save(x)
     t = janus.submit_and_verify(t.id, PHOTOS / "received_match.jpg")
-    assert t.state == State.HELD and "consent" in t.events[-1]["reason"]
+    assert t.state == State.HELD and "customer to confirm" in t.last_verdict.reason
     assert auth_status(janus, t) == "CREATED"  # no money moved
-    assert any(e["kind"] == "rule_blocked" for e in janus.audit.entries(t.id))
 
 
 def test_check_capture_without_any_consent(janus):
@@ -91,10 +90,14 @@ def test_low_confidence_holds_even_if_policy_is_broken(tmp_path, monkeypatch, ve
     assert [e for e in j.audit.entries(t.id) if e["kind"] == "rule_blocked"][0]["data"]["rule"] == "confidence"
 
 
-def test_threshold_edge_is_inclusive(tmp_path):
-    j = jan(tmp_path, confidence=0.85)
+@pytest.mark.parametrize("conf,exif,state", [(0.85, True, State.CAPTURED), (0.849, True, State.HELD),
+                                               (0.90, False, State.CAPTURED), (0.899, False, State.HELD)])
+def test_threshold_edge_is_inclusive(tmp_path, conf, exif, state):
+    """Base bar 0.85; a photo with no EXIF raises it to 0.90. The edge itself passes."""
+    j = jan(tmp_path, confidence=conf)
     t = authorized(j)
-    assert j.submit_and_verify(t.id, PHOTOS / "received_match.jpg").state == State.CAPTURED
+    photo = with_exif("received_match.jpg") if exif else PHOTOS / "received_match.jpg"
+    assert j.submit_and_verify(t.id, photo).state == state
 
 
 # ---------- rule 3: never capture after void or expiry ----------

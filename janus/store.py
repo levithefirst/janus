@@ -77,6 +77,8 @@ class VerdictRecord(BaseModel):
     reason: str
     min_confidence: float = 0.85          # the bar this verdict had to clear (base + evidence trust penalty)
     evidence_by: str = "buyer"            # who submitted the evidence the verdict is about
+    source: str = "ai"                    # ai | quality_gate | integrity
+    trust_flags: list[str] = Field(default_factory=list)
 
 
 class Outcome(BaseModel):
@@ -103,6 +105,7 @@ class Threshold(BaseModel):
     consents: list[Consent] = Field(default_factory=list)
     pending: Optional[Pending] = None
     ever_voided_or_expired: bool = False
+    delivery_location: Optional[list[float]] = None   # optional [lat, lon] for the GPS check
     events: list[dict[str, Any]] = Field(default_factory=list)
 
     @property
