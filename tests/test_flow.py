@@ -123,3 +123,59 @@ def test_failed_capture_can_be_retried(eid, job_text, monkeypatch):
     assert eid.get(job.id).state == State.APPROVED
     monkeypatch.setattr(eid.paypal, "capture_authorization", real)
     assert eid.approve(job.id).state == State.CAPTURED
+
+
+def test_authorize_is_idempotent(eid, job_text):
+    job = to_authorized(eid, job_text)
+    again = eid.authorize(job.id)  # e.g. customer refreshes the PayPal return page
+    assert again.payment.authorization_id == job.payment.authorization_id
+    assert again.state == State.AUTHORIZED
+
+
+def test_invalid_evidence_gives_clear_error(eid, job_text):
+    job = to_authorized(eid, job_text)
+    with pytest.raises(EidError, match="kind"):
+        eid.submit_evidence(job.id, [{"kind": "selfie", "note": "x"}])
+    with pytest.raises(EidError, match="non-empty list"):
+        eid.submit_evidence(job.id, "not a list")
+
+
+def test_lenient_mode_drops_unknown_requirement_hint(eid, job_text):
+    job = to_authorized(eid, job_text)
+    job = eid.submit_evidence(job.id, [{"requirement_id": "E99", "note": "done"}], strict=False)
+    assert job.evidence[0].requirement_id is None
+    assert any(e["action"] == "evidence_hint_dropped" for e in job.events)
+
+
+def test_bad_job_id_is_not_found(eid):
+    from eid.store import JobNotFound
+    for bad in ("../../etc", "job_nope", ""):
+        with pytest.raises(JobNotFound):
+            eid.get(bad)
+
+
+def test_sandbox_without_credentials_is_a_clear_error(tmp_path):
+    from conftest import make_config
+    from eid.service import Eid
+    with pytest.raises(EidError, match="PAYPAL_CLIENT_ID"):
+        Eid(make_config(tmp_path, paypal_mode="sandbox"))
+
+
+def test_concurrent_approvals_capture_once(eid, job_text):
+    import threading
+    job = to_authorized(eid, job_text)
+    eid.submit_evidence(job.id, evidence("evidence_complete.json"), EXAMPLES)
+    eid.generate_packet(job.id)
+    results = []
+
+    def go():
+        try:
+            results.append(eid.approve(job.id).state)
+        except TransitionError:
+            results.append("rejected")
+    threads = [threading.Thread(target=go) for _ in range(5)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert results.count(State.CAPTURED) == 1 and results.count("rejected") == 4
+    log = (eid.config.data_dir / "eid.log.jsonl").read_text()
+    assert log.count('"action": "capture_authorization"') == 1

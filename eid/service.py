@@ -4,9 +4,13 @@ from __future__ import annotations
 import hashlib
 import mimetypes
 import shutil
+import threading
+from functools import wraps
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Iterable, Optional
+
+from pydantic import ValidationError
 
 from .ai import ClaudeAI, MockAI
 from .config import Config
@@ -19,6 +23,15 @@ from .store import Job, Store
 
 class EidError(Exception):
     pass
+
+
+def _locked(fn):
+    """Serialize state-changing steps so two concurrent requests can't double-capture or double-void."""
+    @wraps(fn)
+    def wrapper(self, *a, **k):
+        with self._lock:
+            return fn(self, *a, **k)
+    return wrapper
 
 
 def _money(amount: str) -> str:
@@ -36,9 +49,20 @@ class Eid:
         self.config = config
         setup(config.data_dir)
         self.store = Store(config.data_dir)
-        self.ai = ai or (ClaudeAI(config.model) if config.ai_mode == "claude" else MockAI())
-        self.paypal = paypal or (PayPalSandbox(config.paypal_client_id, config.paypal_client_secret)
-                                 if config.paypal_mode == "sandbox" else PayPalMock(config.data_dir))
+        self._lock = threading.RLock()
+        if ai is None and config.ai_mode == "claude":
+            try:
+                ai = ClaudeAI(config.model)
+            except Exception as e:
+                raise EidError(f"could not start the Claude client ({e}); set ANTHROPIC_API_KEY in .env, "
+                               "or set EID_AI=mock") from e
+        self.ai = ai or MockAI()
+        if paypal is None and config.paypal_mode == "sandbox":
+            if not (config.paypal_client_id and config.paypal_client_secret):
+                raise EidError("EID_PAYPAL=sandbox needs PAYPAL_CLIENT_ID and PAYPAL_CLIENT_SECRET in .env "
+                               "(or leave EID_PAYPAL empty to use the offline mock)")
+            paypal = PayPalSandbox(config.paypal_client_id, config.paypal_client_secret)
+        self.paypal = paypal or PayPalMock(config.data_dir)
 
     @classmethod
     def from_env(cls) -> "Eid":
@@ -64,6 +88,7 @@ class Eid:
 
     # --- 1 + 2: create job, AI job card ---
 
+    @_locked
     def create_job(self, text: str, amount: Optional[str] = None, currency: Optional[str] = None) -> Job:
         text = text.strip()
         if not text:
@@ -74,6 +99,8 @@ class Eid:
             raise EidError("no price found in the job text; pass an amount")
         amount = _money(amount if amount is not None else card.price.amount)
         currency = (currency or (card.price.currency if card.price else None) or "USD").upper()
+        if len(currency) != 3 or not currency.isalpha():
+            raise EidError(f"invalid currency {currency!r}; use a 3-letter code like USD")
         job = Job(id=job_id, state=State.CREATED, created_at=now(), updated_at=now(), source_text=text,
                   card=card, amount=amount, currency=currency)
         self._record(job, "ai", "job_card_decision", title=card.title, checklist=[c.id for c in card.checklist],
@@ -85,6 +112,7 @@ class Eid:
 
     # --- 3: PayPal order + authorization ---
 
+    @_locked
     def create_payment(self, job_id: str) -> Job:
         job = self.get(job_id)
         if job.state == State.PAYMENT_PENDING:  # idempotent: re-issue the same link
@@ -104,8 +132,11 @@ class Eid:
             raise EidError("no PayPal order yet; create the payment first")
         return self.paypal.get_order(job.id, job.payment.order_id).get("status", "UNKNOWN")
 
+    @_locked
     def authorize(self, job_id: str) -> Job:
         job = self.get(job_id)
+        if job.payment.authorization_id:  # already done (e.g. customer refreshed the return page)
+            return job
         check(job.state, State.AUTHORIZED)
         status = self.order_status(job_id)
         if status != "APPROVED":
@@ -120,19 +151,32 @@ class Eid:
 
     # --- 4: evidence ---
 
-    def submit_evidence(self, job_id: str, items: Iterable[dict], base_dir: Path = Path(".")) -> Job:
+    @_locked
+    def submit_evidence(self, job_id: str, items: Iterable[dict], base_dir: Path = Path("."),
+                        strict: bool = True) -> Job:
+        """strict=False drops requirement_ids that aren't on the card instead of rejecting them
+        (requirement_id is only the provider's hint; the AI judges the content either way)."""
         job = self.get(job_id)
         check(job.state, State.EVIDENCE_SUBMITTED)
-        items = list(items)
-        if not items:
-            raise EidError("no evidence items given")
+        items = list(items) if isinstance(items, (list, tuple)) else None
+        if not items or not all(isinstance(i, dict) for i in items):
+            raise EidError('evidence must be a non-empty list of objects like '
+                           '{"requirement_id": "E1", "kind": "photo", "note": "...", "file": "path"}')
         valid_reqs = {r.id for r in job.card.required_evidence}
         ev_dir = self.store.job_dir(job.id) / "evidence"
         added = []
         for raw in items:
-            item = EvidenceItem.model_validate({k: v for k, v in raw.items() if k != "id"})
+            allowed = {"requirement_id", "kind", "note", "file", "media_type"}
+            try:
+                item = EvidenceItem.model_validate({k: v for k, v in raw.items() if k in allowed})
+            except ValidationError as e:
+                err = e.errors()[0]
+                raise EidError(f"invalid evidence item {raw!r}: {'.'.join(map(str, err['loc']))}: {err['msg']}")
             if item.requirement_id and item.requirement_id not in valid_reqs:
-                raise EidError(f"unknown requirement_id {item.requirement_id!r}; valid: {sorted(valid_reqs)}")
+                if strict:
+                    raise EidError(f"unknown requirement_id {item.requirement_id!r}; this job has {sorted(valid_reqs)}")
+                self._record(job, "state", "evidence_hint_dropped", requirement_id=item.requirement_id)
+                item.requirement_id = None
             item.id = f"V{len(job.evidence) + 1}"
             item.submitted_at = now()
             if item.file:
@@ -156,6 +200,7 @@ class Eid:
 
     # --- 5: AI gap report + acceptance packet ---
 
+    @_locked
     def generate_packet(self, job_id: str) -> Job:
         job = self.get(job_id)
         check(job.state, State.PACKET_READY)
@@ -173,6 +218,7 @@ class Eid:
 
     # --- 6: customer decision -> capture or void ---
 
+    @_locked
     def approve(self, job_id: str, note: str = "") -> Job:
         job = self.get(job_id)
         if job.state != State.APPROVED:  # APPROVED means a previous capture attempt failed: retry it
@@ -187,6 +233,7 @@ class Eid:
         self._move(job, State.CAPTURED)
         return job
 
+    @_locked
     def dispute(self, job_id: str, reason: str, kind: str = "dispute") -> Job:
         if kind not in ("dispute", "fix"):
             raise EidError("kind must be 'dispute' or 'fix'")

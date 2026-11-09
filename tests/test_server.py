@@ -61,3 +61,17 @@ def test_http_flow(api, job_text):
     assert status == 200 and packet.startswith("# Acceptance packet")
     status, job, _ = api("POST", f"/jobs/{jid}/approve", {"note": "great"})
     assert status == 200 and job["state"] == "captured"
+
+
+def test_http_edge_cases(api, job_text):
+    jid = api("POST", "/jobs", {"text": job_text})[1]["id"]
+    order_id = api("GET", f"/jobs/{jid}/pay")[2]["Location"].split("token=")[1]
+    api("GET", f"/paypal/return?token={order_id}")
+    status, text, _ = api("GET", f"/paypal/return?token={order_id}")   # customer refreshes
+    assert status == 200 and "authorized" in text
+    status, text, _ = api("GET", f"/jobs/{jid}/pay")                   # customer re-opens link
+    assert status == 200 and "already authorized" in text
+    status, err, _ = api("POST", f"/jobs/{jid}/evidence", {"items": [{"kind": "selfie", "note": "x"}]})
+    assert status == 400 and "kind" in err["error"]
+    assert api("GET", "/jobs/job_00000000")[0] == 404
+    assert api("GET", "/paypal/return")[0] == 400

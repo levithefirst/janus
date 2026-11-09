@@ -13,36 +13,42 @@ Eid is an AI acceptance-and-release agent for local service jobs.
 
 This repo is the backend only: no UI. You drive it with a CLI (`python -m eid ...`) or a small JSON HTTP API (`python -m eid serve`).
 
-## Quick start (offline, no keys)
+## Run the full loop in 2 minutes
+
+Requires Python 3.10+.
 
 ```bash
 git clone https://github.com/levithefirst/eid && cd eid
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-
-python -m eid demo                    # full loop, complete evidence -> approve -> CAPTURE
-python -m eid demo --evidence-file examples/evidence_partial.json   # gaps -> dispute -> VOID
-pytest -q                             # 18 tests: state machine, both outcomes, HTTP API, PayPal + Claude request shapes
+cp .env.example .env          # works unchanged: blank keys = offline mock mode
+python -m eid demo            # steps 1-6, prints each step, ends in "Final state: captured"
 ```
 
-With no credentials set, Eid runs both integrations in **mock** mode. The PayPal mock simulates the buyer approving the order. The AI mock uses simple keyword rules and never looks at files. This tests the state machine and the plumbing, not judgement.
+You can fill in any of the three keys in `.env`; each one switches its integration to the real service:
 
-## Running against PayPal sandbox and Claude
+| `.env` keys set | What `python -m eid demo` does |
+|---|---|
+| none | Both mocked. Runs offline in about a second. The PayPal mock simulates the buyer approving. The AI mock uses keyword rules and doesn't look at photos. |
+| `ANTHROPIC_API_KEY` | Claude writes the job card, inspects the evidence photos, and writes the gap report and packet. Slower: three Claude calls. |
+| `PAYPAL_CLIENT_ID` + `PAYPAL_CLIENT_SECRET` | Real sandbox order, authorization, and capture or void. You approve the payment once in a browser (see below). |
+
+**Other outcomes.** By default (`--outcome auto`) the simulated customer follows the AI: approve → capture, anything else → void.
 
 ```bash
-cp .env.example .env
-# fill in PAYPAL_CLIENT_ID / PAYPAL_CLIENT_SECRET (developer.paypal.com > Apps & Credentials > Sandbox)
-# and ANTHROPIC_API_KEY
-python -m eid demo
+python -m eid demo --evidence-file examples/evidence_partial.json   # gaps found -> dispute -> VOID
+python -m eid demo --outcome approve    # customer approves regardless of the AI -> CAPTURE
+python -m eid demo --outcome fix        # customer requests a fix -> VOID
+pytest -q                               # 25 offline tests
 ```
 
-The mode is chosen per integration: `EID_PAYPAL=sandbox|mock`, `EID_AI=claude|mock`. If you leave them unset, Eid uses the real integration whenever its credentials are present. You can mix them, for example real Claude with mock PayPal.
+With Claude, the default run usually ends in **void**. The example photos in `examples/photos/` are labelled placeholders, and Claude reports that they don't prove the work. Add `--outcome approve` to see a capture.
 
-In sandbox mode, step 3 prints a PayPal approval URL. Open it, log in with a **sandbox Personal (buyer)** account (developer.paypal.com > Testing Tools > Sandbox Accounts) and approve. The demo checks the order every 5 seconds (for up to `--wait`, 600 s by default) and authorizes it once the buyer has approved. You can see the authorization, capture or void in the sandbox merchant account's activity.
+**PayPal sandbox approval (one browser step):** step 3 prints an approval URL and waits. Open it and log in as the sandbox **Personal** account that PayPal creates for you (developer.paypal.com > Testing Tools > Sandbox Accounts > the `...personal.example.com` account > View/Edit for the password). Then click through to approve. The demo checks every 5 seconds and continues on its own. You don't need to run the server for this. The page PayPal redirects to afterwards may not load; that's expected. The authorization, capture or void then shows up in the sandbox Business account's activity.
 
-If you also run `python -m eid serve`, the PayPal return URL (`EID_BASE_URL/paypal/return`) authorizes the order automatically as soon as the buyer is redirected back.
+**Configuration:** every setting is documented in `.env.example`. If you need to force a mode, set `EID_PAYPAL=sandbox|mock` or `EID_AI=claude|mock`.
 
-The AI uses `claude-opus-5-5` (change it with `EID_MODEL`) with structured outputs, so the job card and the gap report are schema-validated JSON. The server-side refusal fallback is enabled (`fallbacks: "default"`), so a declined request is retried on a fallback model. Photos (`png/jpg/gif/webp`), PDFs and text files you attach as evidence are sent to Claude so it can look at them.
+**About the AI:** Claude (`claude-opus-5-5` by default, set with `EID_MODEL`) uses structured outputs, so the job card and the gap report are schema-validated JSON. The server-side refusal fallback is on (`fallbacks: "default"`). Photos (`png/jpg/gif/webp`), PDFs and text files attached as evidence are sent to Claude so it can look at them. The AI only advises; the customer's decision is what moves the money.
 
 ## End-to-end test, step by step (CLI)
 
@@ -59,7 +65,7 @@ python -m eid show <job_id> [--json]                     # inspect state at any 
 python -m eid list
 ```
 
-With Claude, the evidence requirement ids (`E1`, `E2`, ...) can differ from the ones in the example evidence files, so check `create`'s output and edit the `requirement_id`s. The provider's `requirement_id` is only a hint: the AI judges what the evidence actually shows. The photos in `examples/photos/` are labelled placeholders, so expect Claude to say so in its report.
+Each evidence item's `requirement_id` is the provider's hint about which requirement it covers. The AI judges what the evidence actually shows. The `evidence` command rejects ids that aren't on the job card, so with Claude, check `create`'s output first: Claude may number requirements differently from the example files. `demo` drops unknown ids instead and logs that it did.
 
 ## HTTP API
 
@@ -75,7 +81,7 @@ curl -s localhost:8000/jobs/<id>/packet                # Markdown packet
 curl -s localhost:8000/jobs/<id>/approve -d '{}'       # or /dispute -d '{"reason":"...","kind":"fix"}'
 ```
 
-Errors come back as JSON: 409 for a step that isn't allowed in the current state, 400 for bad input, 502 when PayPal or the AI fails.
+Errors come back as JSON: 409 for a step that isn't allowed in the current state, 400 for bad input, 404 for an unknown job, 502 when PayPal or the AI fails. Reopening the customer link or the PayPal return page after authorizing is harmless.
 
 ## State machine
 
@@ -85,7 +91,7 @@ created ─► payment_pending ─► authorized ─► evidence_submitted ⇄ p
                                                 a gap report, before a decision)
 ```
 
-Every change goes through `eid/state.py`, and out-of-order calls raise `TransitionError`. You can't approve before a packet exists, capture twice, or capture a voided authorization. The customer decides, not the AI, so they can approve even when the AI recommends more evidence. If a capture or void call to PayPal fails, the job stays in `approved` or `disputed`, and running the same command again retries it. Every PayPal call that changes something sends a `PayPal-Request-Id`, so retries are idempotent.
+Every change goes through `eid/state.py`, and out-of-order calls raise `TransitionError`. You can't approve before a packet exists, capture twice, or capture a voided authorization. The customer decides, not the AI, so they can approve even when the AI recommends more evidence. If a capture or void call to PayPal fails, the job stays in `approved` or `disputed`, and running the same command again retries it. Every PayPal call that changes something sends a `PayPal-Request-Id`, so retries are idempotent. Steps that change state are serialized, so two simultaneous approvals capture only once.
 
 ## Storage and logs
 

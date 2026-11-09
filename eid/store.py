@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 from pathlib import Path
 from typing import Any, Optional
@@ -66,9 +67,11 @@ class Store:
         os.replace(tmp, d / "job.json")
 
     def load(self, job_id: str) -> Job:
+        if not re.fullmatch(r"job_[0-9a-f]{8}", job_id or ""):
+            raise JobNotFound(f"{job_id!r} (job ids look like job_1a2b3c4d)")
         p = self.job_dir(job_id) / "job.json"
         if not p.is_file():
-            raise JobNotFound(job_id)
+            raise JobNotFound(f"{job_id} (see `python -m eid list`)")
         return Job.model_validate_json(p.read_text())
 
     def all(self) -> list[Job]:

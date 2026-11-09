@@ -22,6 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from .ai import AIError
+from .logs import logger
 from .paypal import PayPalError
 from .service import Eid, EidError
 from .state import TransitionError
@@ -69,6 +70,9 @@ def make_handler(eid: Eid):
                 self._send(400, {"error": str(e)})
             except (PayPalError, AIError) as e:
                 self._send(502, {"error": str(e)})
+            except Exception as e:  # never drop the connection without a response
+                logger.exception("unhandled error on %s %s", method, self.path)
+                self._send(500, {"error": f"internal error: {type(e).__name__}"})
 
         def do_GET(self):
             self._dispatch("GET")
@@ -87,7 +91,9 @@ def make_handler(eid: Eid):
                                          "amount": j.amount, "currency": j.currency} for j in eid.store.all()])
             if parts[:1] == ["paypal"] and method == "GET":
                 if parts[1:] == ["return"]:
-                    j = eid.store.find_by_order(q.get("token", ""))
+                    if not q.get("token"):
+                        raise EidError("missing ?token= (the PayPal order id)")
+                    j = eid.store.find_by_order(q["token"])
                     j = eid.authorize(j.id)
                     return self._send(200, f"Payment of {j.amount} {j.currency} authorized for '{j.card.title}'. "
                                            "Nothing is charged until you approve the finished work.\n", "text/plain")
@@ -98,6 +104,10 @@ def make_handler(eid: Eid):
                 if method == "GET" and action is None:
                     return self._send(200, job())
                 if method == "GET" and action == "pay":
+                    j = eid.get(parts[1])
+                    if j.payment.authorization_id:
+                        return self._send(200, f"Payment for '{j.card.title}' is already authorized "
+                                               f"(job is {j.state.value}).\n", "text/plain")
                     j = eid.create_payment(parts[1])
                     if not j.payment.approve_url:
                         raise EidError("PayPal returned no approval link")

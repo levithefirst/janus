@@ -13,6 +13,8 @@ from .service import Eid, EidError
 from .state import TransitionError
 from .store import Job, JobNotFound
 
+REPO = Path(__file__).resolve().parent.parent
+
 
 def summary(job: Job) -> str:
     c = job.card
@@ -47,10 +49,17 @@ def evidence_from_args(a) -> tuple[list[dict], Path]:
     if a.json:
         path = Path(a.json)
         data = json.loads(path.read_text())
-        return (data["items"] if isinstance(data, dict) else data), path.parent
+        items = data.get("items") if isinstance(data, dict) else data
+        return items, path.parent
     if not (a.note or a.file):
         raise EidError("give --json FILE, or --note/--file for a single item")
     return [{"requirement_id": a.req, "kind": a.kind, "note": a.note or "", "file": a.file}], Path(".")
+
+
+def example_path(p: str) -> Path:
+    """Resolve the demo's default example files even when run from outside the repo root."""
+    path = Path(p)
+    return path if path.exists() or path.is_absolute() else REPO / p
 
 
 def demo(eid: Eid, a) -> Job:
@@ -59,7 +68,7 @@ def demo(eid: Eid, a) -> Job:
         print(f"\n=== {n}. {msg} ===")
 
     step(1, "Create job from text")
-    text = Path(a.text_file).read_text()
+    text = example_path(a.text_file).read_text()
     print(text.strip())
     step(2, "AI job card + checklist + required evidence")
     job = eid.create_job(text, a.amount)
@@ -69,12 +78,15 @@ def demo(eid: Eid, a) -> Job:
     print(f"  Customer link: {eid.customer_link(job)}")
     print(f"  PayPal approval URL: {job.payment.approve_url}")
     if eid.paypal.mode == "sandbox":
-        print("  Open the approval URL, log in with a SANDBOX PERSONAL account, and approve.")
+        print("  >>> Open the approval URL in a browser, log in with your SANDBOX PERSONAL (buyer) account,")
+        print("  >>> and click through to approve. Waiting up to", a.wait, "seconds...")
+    else:
+        print("  (mock PayPal: simulating the customer approving the order)")
     job = wait_authorize(eid, job.id, a.wait)
     print(f"  Authorized: {job.payment.authorization_id}")
     step(4, "Provider submits evidence")
-    items, base = evidence_from_args(argparse.Namespace(json=a.evidence_file, note=None, file=None))
-    job = eid.submit_evidence(job.id, items, base)
+    items, base = evidence_from_args(argparse.Namespace(json=str(example_path(a.evidence_file)), note=None, file=None))
+    job = eid.submit_evidence(job.id, items, base, strict=False)
     print("  " + ", ".join(f"{e.id}: {e.note[:50]}" for e in job.evidence))
     step(5, "AI gap report + acceptance packet")
     job = eid.generate_packet(job.id)
@@ -127,9 +139,9 @@ def main(argv=None) -> int:
     s.add_argument("--wait", type=int, default=600, help="seconds to wait for sandbox buyer approval")
 
     a = p.parse_args(argv)
-    eid = Eid.from_env()
-    print(f"(paypal={eid.paypal.mode}, ai={eid.ai.mode}, data={eid.config.data_dir})", file=sys.stderr)
     try:
+        eid = Eid.from_env()
+        print(f"(paypal={eid.paypal.mode}, ai={eid.ai.mode}, data={eid.config.data_dir})", file=sys.stderr)
         if a.cmd == "create":
             text = a.text or (Path(a.file).read_text() if a.file else sys.stdin.read())
             print(summary(eid.create_job(text, a.amount, a.currency)))
@@ -161,7 +173,19 @@ def main(argv=None) -> int:
             serve(eid, a.host, a.port)
         elif a.cmd == "demo":
             demo(eid, a)
-    except (EidError, TransitionError, JobNotFound, PayPalError, AIError) as e:
-        print(f"error: {type(e).__name__}: {e}", file=sys.stderr)
+    except TransitionError as e:
+        print(f"error: step not allowed now: {e}", file=sys.stderr)
+        return 1
+    except JobNotFound as e:
+        print(f"error: job not found: {e}", file=sys.stderr)
+        return 1
+    except (EidError, PayPalError, AIError, ValueError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    except json.JSONDecodeError as e:
+        print(f"error: invalid JSON: {e}", file=sys.stderr)
+        return 1
+    except OSError as e:
+        print(f"error: {e.strerror or e}: {e.filename or ''}", file=sys.stderr)
         return 1
     return 0
