@@ -189,3 +189,61 @@ def test_dispute_can_end_in_refund_or_release(janus):
     b = authorized(janus)
     janus.dispute(b.id, "x")
     assert janus.release(b.id).state == State.CAPTURED
+
+
+# ---------- zero capture (regression) ----------
+
+def held_itemized(tmp_path, statuses):
+    """An itemized job in HELD whose items have been given these statuses, with PayPal calls counted."""
+    j, t = itemized(tmp_path, [{r: ("cannot_tell", 0.2) for r in ALLOC}])
+    t = j.submit_and_verify(t.id, photo(0))
+    assert t.state == State.HELD
+    with j.store.lock(t.id):
+        x = j.get(t.id)
+        x.item_status = dict(statuses)
+        j.store.save(x)
+    calls = []
+    real = j.paypal.capture_authorization
+
+    def spy(*a, **k):
+        calls.append((a, k))
+        return real(*a, **k)
+    j.paypal.capture_authorization = spy
+    return j, t, calls
+
+
+def test_release_with_nothing_pending_is_refused_without_calling_paypal(tmp_path):
+    j, t, calls = held_itemized(tmp_path, {r: "released" for r in ALLOC})
+    before = j.get(t.id)
+    with pytest.raises(JanusError, match="nothing left to capture"):
+        j.release(t.id)
+    after = j.get(t.id)
+    assert calls == [] and after.state == State.HELD and after.pending is None
+    assert len(after.consents) == len(before.consents) and after.version == before.version
+    assert not after.payment.captures
+
+
+def test_release_when_every_item_is_captured_is_an_audited_noop(tmp_path):
+    j, t, calls = held_itemized(tmp_path, {r: "captured" for r in ALLOC})
+    after = j.release(t.id)
+    assert calls == [] and after.state == State.HELD and not after.payment.captures
+    assert any(e["kind"] == "release_noop" for e in j.audit.entries(t.id))
+    assert not any(c.kind == "release" for c in after.consents)
+
+
+def test_capture_amount_zero_or_negative_never_reaches_paypal(tmp_path):
+    j, t, calls = held_itemized(tmp_path, {r: "pending" for r in ALLOC})
+    for bad in ("0", "0.00", "-1.00"):
+        with j.store.lock(t.id):
+            x = j.get(t.id)
+            with pytest.raises(JanusError, match="nothing to capture"):
+                j._start(x, "capture", "buyer", "r", amount=bad)
+    assert calls == [] and j.get(t.id).state == State.HELD and j.get(t.id).pending is None
+    # a record that somehow reached the settle step with a zero amount is held, not sent
+    from janus.store import Pending
+    with j.store.lock(t.id):
+        x = j.get(t.id)
+        x.pending = Pending(action="capture", by="buyer", reason="r", request_id="rid", amount="0.00", at="now")
+        j._move(x, State.CAPTURING)
+        j._settle(x)
+    assert calls == [] and j.get(t.id).state == State.HELD

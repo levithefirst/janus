@@ -474,11 +474,18 @@ class Janus:
         """The customer releases the held money to the provider (capture). This is explicit consent."""
         with self._locked(tid) as t:
             check(t.state, State.CAPTURING)
+            pending = [r for r, st in t.item_status.items() if st == "pending"]
+            if t.allocations and not pending:
+                # Nothing is left to capture: never call PayPal with an amount of zero.
+                if all(st == "captured" for st in t.item_status.values()):
+                    self._audit(t, "release_noop", "buyer", "release asked, but every item is already captured",
+                                channel=channel)
+                    return t
+                raise JanusError("there is nothing left to capture: every item is already captured or released")
             t.consents.append(Consent(kind="release", by="buyer", at=now(), terms_hash=rules.terms_hash(t),
                                       amount=t.amount, channel=channel))
             self._audit(t, "consent", "buyer", "customer released the payment", consent_kind="release",
                         channel=channel)
-            pending = [r for r, st in t.item_status.items() if st == "pending"]
             if t.allocations:
                 amount = str(sum(Decimal(t.allocations[r]) for r in pending))
                 return self._start(t, "capture", "buyer", note or "Buyer released the payment", amount=amount,
@@ -665,6 +672,8 @@ class Janus:
         mid = State.CAPTURING if action == "capture" else State.VOIDING
         if action == "capture":
             amount = amount or str(Decimal(t.amount) - self._captured_total(t))
+            if Decimal(amount) <= 0:  # last line of defence: PayPal is never asked to capture zero or less
+                raise JanusError(f"nothing to capture (amount {amount})")
             rid = make_request_id(t.id, "capture", len(t.payment.captures) + 1)
         else:
             rid = make_request_id(t.id, "void")
@@ -694,6 +703,10 @@ class Janus:
             return self._finish(t, target, Outcome(action=act, by=pend.by if act == action else "paypal",
                                                    reason=why or pend.reason, at=now()))
 
+        if action == "capture" and Decimal(pend.amount or "0") <= 0:
+            self._audit(t, "rule_blocked", pend.by, "capture amount is zero or negative", rule="amount",
+                        request_id=pend.request_id)
+            return self._hold(t, "Blocked: the capture amount is not positive", actor="rules")
         if action == "capture":
             try:
                 rules.check_capture(t, pend.by, self.config.min_confidence)
