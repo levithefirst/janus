@@ -121,7 +121,10 @@ def analyze(raw: bytes) -> dict:
     small = img.copy()
     small.thumbnail((512, 512))
     gray = small.convert("L")
-    sharp = ImageStat.Stat(gray.filter(ImageFilter.FIND_EDGES)).var[0]
+    edges = gray.filter(ImageFilter.FIND_EDGES)
+    # Pillow leaves the 1px border unfiltered (raw pixel values), which swamps the variance: crop it off.
+    edges = edges.crop((2, 2, edges.width - 2, edges.height - 2))
+    sharp = ImageStat.Stat(edges).var[0]
     bright = ImageStat.Stat(gray).mean[0]
     reasons = []
     if min(w, h) < MIN_SHORT_SIDE or w * h < MIN_PIXELS:

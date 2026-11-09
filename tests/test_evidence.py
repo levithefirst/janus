@@ -189,3 +189,12 @@ def test_manipulated_model_output_still_holds(tmp_path):
     t = authorized(jj)
     t = jj.submit_and_verify(t.id, with_exif("received_match.jpg"))
     assert t.state == State.HELD and "contradicts" in t.last_verdict.reason
+
+
+@pytest.mark.parametrize("spec,ok", [(None, True), ("rotate:8", True), ("brightness:0.7", True),
+                                     ("blur:3", False), ("blur:12", False)])
+def test_sharpness_ignores_the_unfiltered_border(spec, ok):
+    """Regression: Pillow's FIND_EDGES leaves the border raw, which made every blur level look sharp."""
+    from janus.calibration import transform
+    from janus.evidence import analyze
+    assert analyze(transform((PHOTOS / "received_match.jpg").read_bytes(), spec))["quality_ok"] is ok
