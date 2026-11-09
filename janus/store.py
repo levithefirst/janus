@@ -101,7 +101,7 @@ class Outcome(BaseModel):
 class Threshold(BaseModel):
     id: str
     version: int = 0             # compare-and-set: bumped on every save
-    seller_key: str
+    tenant: str = "public"       # tokens are bound to it; a tenant key only reaches its own thresholds
     state: State
     created_at: str
     updated_at: str
@@ -155,11 +155,7 @@ class Store:
 
     @staticmethod
     def new_id() -> str:
-        return "th_" + secrets.token_hex(5)
-
-    @staticmethod
-    def new_key() -> str:
-        return secrets.token_urlsafe(12)
+        return "th_" + secrets.token_hex(8)  # an identifier, not a credential: access needs a token
 
     def dir(self, tid: str) -> Path:
         return self.root / tid

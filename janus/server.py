@@ -29,23 +29,38 @@ import re
 from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Optional
 from urllib.parse import parse_qs, quote, urlparse
 
 from . import clock
 from .ai import AIError
+from .logs import log_event
+from .rules import RuleViolation
 from .paypal import PayPalError
 from .service import Janus, JanusError
 from .state import HOLDS_FUNDS, State, TransitionError
+from .security import RateLimiter
 from .store import NotFound, Threshold
 
 STATIC = Path(__file__).parent / "static"
 MAX_BODY = 20 * 1024 * 1024
-ID = re.compile(r"th_[0-9a-f]{10}")
+ID = re.compile(r"th_[0-9a-f]{16}")
+
+# Who may call what. Anything not listed here is refused. Unknown threshold or wrong token -> 404,
+# so ids cannot be probed. The evidence submitter is whoever the token says, never the request body.
+BUYER, SELLER, ADMIN = "buyer", "seller", "admin"
+API_ROLES = {
+    "consent": {BUYER}, "payment": {BUYER}, "authorize": {BUYER}, "release": {BUYER}, "dispute": {BUYER},
+    "withdraw_dispute": {BUYER}, "accept_amendment": {BUYER}, "reject_amendment": {BUYER},
+    "refund": {SELLER}, "allocations": {SELLER}, "amend": {SELLER},
+    "evidence": {BUYER, SELLER}, "verify": {BUYER, SELLER}, "settle": {BUYER, SELLER}, "refresh": {BUYER, SELLER},
+}
+READ_ROLES = {BUYER, SELLER, ADMIN}
 e = html.escape
 
 
 def public(t: Threshold) -> dict:
-    d = t.model_dump(mode="json", exclude={"seller_key"})
+    d = t.model_dump(mode="json", exclude={"events"})
     d["amount"], d["currency"] = t.amount, t.currency
     return d
 
@@ -117,7 +132,9 @@ async function shrink(file){ // phone photos -> max 1600px JPEG, so uploads are 
 }
 function preview(input,id){const f=input.files[0];const el=document.getElementById(id);
   if(f&&el){el.src=URL.createObjectURL(f);el.style.display='block'}}
-async function post(url,body){const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},
+async function post(url,body){const h={'Content-Type':'application/json'};
+  const tk=document.body.dataset.token;if(tk)h['X-Janus-Token']=tk;
+  const r=await fetch(url,{method:'POST',headers:h,
   body:JSON.stringify(body||{})});const d=await r.json().catch(()=>({error:'bad response'}));
   if(!r.ok)throw new Error(d.error||('HTTP '+r.status));return d}
 function busy(on,msg){const b=document.getElementById('busy');if(!b)return;b.style.display=on?'block':'none';
@@ -128,13 +145,14 @@ function copy(id){const i=document.getElementById(id);i.select();navigator.clipb
 """
 
 
-def page(title: str, body: str, refresh: int = 0) -> str:
+def page(title: str, body: str, refresh: int = 0, token: str = "") -> str:
     logo = (STATIC / "logo.svg").read_text()
     meta = f'<meta http-equiv="refresh" content="{refresh}">' if refresh else ""
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">{meta}
+<meta name="referrer" content="no-referrer">
 <title>{e(title)}</title><link rel="icon" href="/logo.svg"><style>{CSS}</style></head>
-<body><main><header>{logo}<div><b>Janus Threshold</b><br><span>Describe what must be true. Janus verifies it.
+<body data-token="{e(token)}"><main><header>{logo}<div><b>Janus Threshold</b><br><span>Describe what must be true. Janus verifies it.
 PayPal moves the money.</span></div></header>{body}
 <div id="busy" class="banner b-info"><span class="spin"></span> <span class="msg">Working…</span></div>
 </main><script>{JS}</script></body></html>"""
@@ -182,10 +200,11 @@ def _req_list(t: Threshold, checks: dict | None = None) -> str:
     return f'<ul class="reqs">{"".join(items)}</ul>'
 
 
-def _img(t: Threshold, rel: str | None, cap: str = "") -> str:
+def _img(j: Janus, t: Threshold, rel: str | None, cap: str = "") -> str:
     if not rel:
         return ""
-    fig = f'<img class="photo" src="/t/{t.id}/files/{quote(rel)}" alt="{e(cap)}" loading="lazy">'
+    src = j.security.sign_path(f"/t/{t.id}/files/{quote(rel)}")
+    fig = f'<img class="photo" src="{e(src)}" alt="{e(cap)}" loading="lazy">'
     return f"<figure>{fig}<figcaption>{e(cap)}</figcaption></figure>" if cap else fig
 
 
@@ -203,7 +222,8 @@ def _upload_form(t: Threshold, label: str) -> str:
 def threshold_page(j: Janus, t: Threshold, seller: bool) -> str:
     money = f"{t.amount} {t.currency}"
     p, v = t.payment, t.last_verdict
-    key_q = f"?k={quote(t.seller_key)}" if seller else ""
+    me = j.token(t, "seller" if seller else "buyer")
+    key_q = f"?k={quote(me)}" if seller else ""
     parts, refresh = [], 0
 
     # -- outcome / next step banner
@@ -215,7 +235,7 @@ on PayPal. Nothing is charged unless your condition is met.</p><div class="copy"
         else:
             parts.append(f"""<div class="banner b-info">Authorize {e(money)} with PayPal<p>PayPal holds the money.
 The seller is paid only if the item you receive meets the condition below; otherwise the hold is released
-and you are not charged.</p><a class="btn" href="/t/{t.id}/pay">Authorize with PayPal</a></div>""")
+and you are not charged.</p><a class="btn" href="/t/{t.id}/pay?t={quote(me)}">Authorize with PayPal</a></div>""")
             refresh = 0
     elif t.state == State.AUTHORIZED:
         parts.append(f'<div class="banner b-info">PayPal is holding {e(money)}<p>When the item arrives, '
@@ -259,7 +279,7 @@ Retrying is safe: PayPal sees the same request id and will not act twice.</p>
             parts.append(f"""<div class="card"><h2>Seller</h2><p class="small muted">You can always give up the
 payment. You can't capture it yourself: only a verified condition or the buyer can.</p>
 <button class="btn ghost" onclick="if(confirm('Release the hold and refund the buyer?'))act('/api/t/{t.id}/refund',
-{{key:'{e(t.seller_key)}'}},'Voiding on PayPal…')">Refund the buyer (void)</button></div>""")
+{{}},'Voiding on PayPal…')">Refund the buyer (void)</button></div>""")
         elif t.state == State.HELD:
             parts.append(f"""<div class="card"><h2>Or decide yourself</h2><p class="small muted">If you're happy
 with the item, you can release the payment to the seller.</p><button class="btn ghost"
@@ -269,8 +289,8 @@ Release payment to seller</button></div>""")
     # -- verdicts
     for i, rec in enumerate(reversed(t.verdicts)):
         ev = {x.id: x for x in t.evidence}
-        photos = "".join(_img(t, ev[x].file, f"Buyer photo {x}") for x in rec.evidence_ids[-1:] if x in ev)
-        listing_img = _img(t, t.listing.photos[0], "Listing photo") if t.listing.photos else ""
+        photos = "".join(_img(j, t, ev[x].file, f"Buyer photo {x}") for x in rec.evidence_ids[-1:] if x in ev)
+        listing_img = _img(j, t, t.listing.photos[0], "Listing photo") if t.listing.photos else ""
         checks = {c.requirement_id: c for c in rec.verdict.checks}
         label = "Janus verdict" if i == 0 else "Earlier verdict"
         parts.append(f"""<div class="card"><h2>{label}</h2><p><b>{e(rec.verdict.verdict.replace('_', ' ').upper())}</b>
@@ -278,7 +298,7 @@ Release payment to seller</button></div>""")
 <p class="small muted">{e(rec.reason)}</p><div class="thumbs">{listing_img}{photos}</div>{_req_list(t, checks)}</div>""")
 
     # -- listing + condition
-    photo = _img(t, t.listing.photos[0]) if t.listing.photos else ""
+    photo = _img(j, t, t.listing.photos[0]) if t.listing.photos else ""
     nv = (f'<p class="small muted">A photo can\'t prove: {e("; ".join(t.compiled.not_verifiable))}</p>'
           if t.compiled.not_verifiable else "")
     parts.append(f"""<div class="card"><h2>The item</h2>{photo}<h1>{e(t.listing.title)}</h1>
@@ -299,8 +319,8 @@ Release payment to seller</button></div>""")
         parts.append(f'<div class="card"><h2>PayPal record</h2><dl>{dl}</dl>{honor}</div>')
     if seller:
         parts.append(f'<p class="small muted">Seller view. Keep this link private: <a href="/t/{t.id}{key_q}">'
-                     f'seller link</a> · <a href="/t/{t.id}">buyer link</a></p>')
-    return page(f"{t.listing.title} · Janus", "".join(parts), refresh)
+                     f'seller link</a> · <a href="{e(j.buyer_link(t))}">buyer link</a></p>')
+    return page(f"{t.listing.title} · Janus", "".join(parts), refresh, token=me)
 
 
 def message_page(title: str, msg: str, link: str = "/") -> str:
@@ -309,7 +329,9 @@ def message_page(title: str, msg: str, link: str = "/") -> str:
 
 # ---------------------------------------------------------------- HTTP
 
-def make_handler(j: Janus):
+def make_handler(j: Janus, limiter: Optional[RateLimiter] = None):
+    limiter = limiter or RateLimiter()
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):  # keep stderr for janus's own log lines
             pass
@@ -326,10 +348,21 @@ def make_handler(j: Janus):
             self.end_headers()
             self.wfile.write(data)
 
-        def _redirect(self, url: str):
+        def _redirect(self, url: str, cookie: str = ""):
             self.send_response(303)
             self.send_header("Location", url)
+            if cookie:
+                self.send_header("Set-Cookie", cookie)
             self.end_headers()
+
+        def _cookie(self, name: str) -> Optional[str]:
+            from http.cookies import SimpleCookie
+            c = SimpleCookie()
+            try:
+                c.load(self.headers.get("Cookie") or "")
+            except Exception:
+                return None
+            return c[name].value if name in c else None
 
         def _body(self) -> dict:
             n = int(self.headers.get("Content-Length") or 0)
@@ -342,18 +375,49 @@ def make_handler(j: Janus):
             except json.JSONDecodeError:
                 raise JanusError("request body must be JSON")
 
+        def _credential(self, q: dict, body: Optional[dict] = None) -> Optional[str]:
+            h = self.headers.get("X-Janus-Token") or ""
+            auth = self.headers.get("Authorization") or ""
+            if not h and auth.lower().startswith("bearer "):
+                h = auth[7:].strip()
+            return h or q.get("t") or q.get("k") or None
+
+        def _need(self, tid: str, roles: set[str], cred: Optional[str]) -> tuple[Threshold, str]:
+            t = j.get(tid)  # NotFound -> 404
+            role = j.role_for(t, cred)
+            if role not in roles:
+                log_event("security", "denied", tid, path=urlparse(self.path).path, role=role)
+                raise NotFound(tid)  # same answer as a missing threshold: nothing to probe
+            return t, role
+
+        def _bucket(self, method: str, parts: list[str]) -> str:
+            if parts == ["paypal", "webhook"]:
+                return "webhook"
+            if method == "POST" and (parts == ["api", "thresholds"] or parts[-1:] in (["evidence"], ["verify"])):
+                return "expensive"  # these call the AI
+            return "write" if method == "POST" else "read"
+
         def _dispatch(self, method: str):
             url = urlparse(self.path)
             q = {k: v[0] for k, v in parse_qs(url.query).items()}
             parts = [p for p in url.path.split("/") if p]
-            api = parts[:1] == ["api"]
+            api = parts[:1] == ["api"] or parts[:1] == ["paypal"] and parts[1:] == ["webhook"]
+            ok, wait = limiter.allow(self.client_address[0], self._bucket(method, parts))
+            if not ok:
+                log_event("security", "rate_limited", path=url.path, bucket=self._bucket(method, parts))
+                self.send_response(429)
+                self.send_header("Retry-After", str(max(1, int(wait) + 1)))
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"error": "too many requests"}')
+                return
             try:
                 self._route(method, parts, q)
-            except NotFound as ex:
-                self._err(api, 404, f"not found: {ex}")
+            except NotFound:
+                self._err(api, 404, "not found")
             except TransitionError as ex:
                 self._err(api, 409, str(ex))
-            except JanusError as ex:
+            except (JanusError, RuleViolation) as ex:
                 self._err(api, 400, str(ex))
             except (PayPalError, AIError) as ex:
                 self._err(api, 502, str(ex))
@@ -361,7 +425,8 @@ def make_handler(j: Janus):
         def _err(self, api: bool, status: int, msg: str):
             if api:
                 return self._send(status, {"error": msg})
-            self._send(status, message_page("Something went wrong", msg), "text/html")
+            self._send(status, message_page("Not found" if status == 404 else "Something went wrong", msg),
+                       "text/html")
 
         def do_GET(self):
             self._dispatch("GET")
@@ -382,49 +447,8 @@ def make_handler(j: Janus):
 
         def _route(self, method, parts, q):
             if method == "GET":
-                if not parts:
-                    return self._send(200, landing(j), "text/html")
-                if parts == ["logo.svg"]:
-                    return self._send(200, (STATIC / "logo.svg").read_bytes(), "image/svg+xml")
-                if parts == ["healthz"]:
-                    return self._send(200, {"ok": True, "paypal": j.paypal.mode, "ai": j.ai.mode})
-                if parts == ["paypal", "return"]:
-                    t = j.store.find_by_order(q.get("token", ""))
-                    try:
-                        j.authorize(t.id)
-                    except JanusError as ex:
-                        return self._send(200, message_page("Not authorized yet", str(ex), f"/t/{t.id}"), "text/html")
-                    return self._redirect(f"/t/{t.id}")
-                if len(parts) >= 2 and parts[0] == "t" and ID.fullmatch(parts[1]):
-                    tid = parts[1]
-                    if len(parts) == 2:
-                        t = self._view(tid)
-                        return self._send(200, threshold_page(j, t, j.is_seller(t, q.get("k"))), "text/html")
-                    if parts[2:] == ["pay"]:
-                        # The buyer clicked "Authorize with PayPal" on a page that states the condition and
-                        # says the payment is captured automatically when it is verified: explicit consent.
-                        if j.get(tid).state == State.CREATED:
-                            j.consent(tid, channel="web")
-                        t = j.create_payment(tid)
-                        if t.state != State.PAYMENT_PENDING or not t.payment.approve_url:
-                            return self._redirect(f"/t/{tid}")
-                        return self._redirect(t.payment.approve_url)
-                    if parts[2] == "files" and len(parts) == 5 and parts[3] in ("listing", "evidence"):
-                        f = (j.store.dir(tid) / parts[3] / parts[4]).resolve()
-                        if f.parent == (j.store.dir(tid) / parts[3]).resolve() and f.is_file():
-                            ctype = "image/jpeg" if f.suffix in (".jpg", ".jpeg") else f"image/{f.suffix[1:]}"
-                            return self._send(200, f.read_bytes(), ctype)
-                if parts[:2] == ["api", "t"] and len(parts) == 3 and ID.fullmatch(parts[2]):
-                    return self._send(200, public(j.get(parts[2])))
-                if parts[:2] == ["api", "t"] and parts[3:] == ["packet"] and ID.fullmatch(parts[2]):
-                    from .packet import build
-                    return self._send(200, build(j.get(parts[2])), "text/markdown")
-                if parts == ["api", "thresholds"]:
-                    return self._send(200, [{"id": t.id, "state": t.state.value, "title": t.listing.title,
-                                             "amount": t.amount, "currency": t.currency} for t in j.store.all()])
-                return self._send(404, message_page("Not found", "There is nothing here."), "text/html")
-
-            if parts == ["paypal", "webhook"]:
+                return self._get(parts, q)
+            if parts == ["paypal", "webhook"]:  # authenticated by PayPal's signature
                 from .webhooks import handle
                 n = int(self.headers.get("Content-Length") or 0)
                 if n > MAX_BODY:
@@ -432,43 +456,113 @@ def make_handler(j: Janus):
                 status, out = handle(j, dict(self.headers.items()), self.rfile.read(n))
                 return self._send(status, out)
             b = self._body()
+            cred = self._credential({}, b)
             if parts == ["api", "thresholds"]:
+                tenant = j.security.tenant_of_key(cred)
+                if tenant is None and not j.config.public_create:
+                    return self._send(401, {"error": "a tenant key is required to create thresholds"})
                 photo = _b64(b["photo_b64"]) if b.get("photo_b64") else None
                 t = j.create(b.get("title", ""), str(b.get("price", "")), b.get("condition", ""),
-                             b.get("description", ""), b.get("currency") or "USD", [photo] if photo else [])
+                             b.get("description", ""), b.get("currency") or "USD", [photo] if photo else [],
+                             tenant=tenant or "public")
                 return self._send(201, {"id": t.id, "buyer_link": j.buyer_link(t),
                                         "seller_link": j.seller_link(t), "threshold": public(t)})
-            if parts[:2] == ["api", "t"] and len(parts) == 4 and ID.fullmatch(parts[2]):
+            if parts[:2] == ["api", "t"] and len(parts) == 4 and ID.fullmatch(parts[2]) and parts[3] in API_ROLES:
                 tid, action = parts[2], parts[3]
+                t, role = self._need(tid, API_ROLES[action], cred)
                 if action == "consent":
-                    return self._send(200, public(j.consent(tid, channel="api",
-                                                            evidence_from=b.get("evidence_from"))))
-                if action == "payment":
+                    t = j.consent(tid, channel="api", evidence_from=b.get("evidence_from"))
+                elif action == "payment":
                     t = j.create_payment(tid)
                     return self._send(200, {"buyer_link": j.buyer_link(t), "approve_url": t.payment.approve_url,
                                             "order_id": t.payment.order_id, "state": t.state.value})
-                if action == "evidence":
+                elif action == "evidence":
                     photo = _b64(b["photo_b64"]) if b.get("photo_b64") else None
-                    if b.get("verify", True):
-                        t = j.submit_and_verify(tid, photo, b.get("note", ""))
-                    else:
-                        t = j.submit_evidence(tid, photo, b.get("note", ""))
+                    t = (j.submit_and_verify if b.get("verify", True) else j.submit_evidence)(
+                        tid, photo, b.get("note", ""), by=role)
+                else:
+                    t = {
+                        "authorize": lambda: j.authorize(tid),
+                        "verify": lambda: j.verify(tid),
+                        "release": lambda: j.release(tid, b.get("note", ""), channel="api"),
+                        "refund": lambda: j.refund(tid, b.get("note", "")),
+                        "settle": lambda: j.retry_settlement(tid),
+                        "refresh": lambda: j.refresh(tid),
+                        "dispute": lambda: j.dispute(tid, b.get("reason", "")),
+                        "withdraw_dispute": lambda: j.withdraw_dispute(tid),
+                        "accept_amendment": lambda: j.accept_amendment(tid, channel="api"),
+                        "reject_amendment": lambda: j.reject_amendment(tid),
+                        "allocations": lambda: j.set_allocations(tid, b.get("allocations") or {}),
+                        "amend": lambda: j.propose_amendment(tid, b.get("condition"), b.get("price"),
+                                                             b.get("reason", "")),
+                    }[action]()
+                return self._send(200, public(t))
+            raise NotFound("route")
+
+        def _get(self, parts, q):
+            if not parts:
+                return self._send(200, landing(j), "text/html")
+            if parts == ["logo.svg"]:
+                return self._send(200, (STATIC / "logo.svg").read_bytes(), "image/svg+xml")
+            if parts == ["healthz"]:
+                return self._send(200, {"ok": True})
+            cred = self._credential(q)
+            if parts == ["paypal", "return"]:
+                # No credential travels through PayPal. Authorizing an order the buyer approved on PayPal is
+                # idempotent and cannot move money, so it needs no token. The buyer's own token comes back in
+                # the HttpOnly cookie set when they tapped "Authorize", and takes them back to their page.
+                t = j.store.find_by_order(q.get("token", ""))
+                try:
+                    j.authorize(t.id)
+                except JanusError as ex:
+                    return self._send(200, message_page("Not authorized yet", str(ex), "/"), "text/html")
+                bt = self._cookie(f"janus_{t.id}")
+                if j.role_for(t, bt) == BUYER:
+                    return self._redirect(f"/t/{t.id}?t={quote(bt)}")
+                return self._send(200, message_page("Payment authorized", "PayPal is holding the money. Go back "
+                                                    "to the link the seller sent you to continue.", "/"), "text/html")
+            if len(parts) >= 2 and parts[0] == "t" and ID.fullmatch(parts[1]):
+                tid = parts[1]
+                if len(parts) == 5 and parts[2] == "files" and parts[3] in ("listing", "evidence"):
+                    path = f"/t/{tid}/files/{parts[3]}/{quote(parts[4])}"
+                    if not j.security.check_signed(path, q.get("exp"), q.get("sig")):
+                        raise NotFound(tid)
+                    f = (j.store.dir(tid) / parts[3] / parts[4]).resolve()
+                    if f.parent != (j.store.dir(tid) / parts[3]).resolve() or not f.is_file():
+                        raise NotFound(tid)
+                    ctype = "image/jpeg" if f.suffix in (".jpg", ".jpeg") else f"image/{f.suffix[1:]}"
+                    return self._send(200, f.read_bytes(), ctype)
+                t, role = self._need(tid, {BUYER, SELLER}, cred)
+                if len(parts) == 2:
+                    return self._send(200, threshold_page(j, self._view(tid), role == SELLER), "text/html")
+                if parts[2:] == ["pay"] and role == BUYER:
+                    # The buyer clicked "Authorize with PayPal" on a page that states the condition and
+                    # says the payment is captured automatically when it is verified: explicit consent.
+                    if t.state == State.CREATED:
+                        j.consent(tid, channel="web")
+                    t = j.create_payment(tid)
+                    if t.state != State.PAYMENT_PENDING or not t.payment.approve_url:
+                        return self._redirect(j.buyer_link(t))
+                    secure = "; Secure" if j.config.base_url.startswith("https") else ""
+                    return self._redirect(t.payment.approve_url, cookie=f"janus_{tid}={cred}; Path=/paypal/return; "
+                                                                        f"Max-Age=3600; HttpOnly; SameSite=Lax{secure}")
+                raise NotFound(tid)
+            if parts[:2] == ["api", "t"] and len(parts) in (3, 4) and ID.fullmatch(parts[2]):
+                t, _ = self._need(parts[2], READ_ROLES, cred)
+                if len(parts) == 3:
                     return self._send(200, public(t))
-                if action == "refund":
-                    t = j.get(tid)
-                    if not j.is_seller(t, b.get("key")):
-                        return self._send(403, {"error": "only the seller can refund (send the seller key)"})
-                    return self._send(200, public(j.refund(tid, b.get("note", ""))))
-                handlers = {
-                    "authorize": lambda: j.authorize(tid),
-                    "verify": lambda: j.verify(tid),
-                    "release": lambda: j.release(tid, b.get("note", "")),
-                    "settle": lambda: j.retry_settlement(tid),
-                    "refresh": lambda: j.refresh(tid),
-                }
-                if action in handlers:
-                    return self._send(200, public(handlers[action]()))
-            self._send(404, {"error": "not found"})
+                if parts[3] == "packet":
+                    from .packet import build
+                    return self._send(200, build(t), "text/markdown")
+                raise NotFound(t.id)
+            if parts == ["api", "thresholds"]:
+                tenant = j.security.tenant_of_key(cred)
+                if tenant is None and not j.security.is_admin(cred):
+                    return self._send(401, {"error": "a tenant key or admin token is required"})
+                return self._send(200, [{"id": t.id, "state": t.state.value, "title": t.listing.title,
+                                         "amount": t.amount, "currency": t.currency, "tenant": t.tenant}
+                                        for t in j.store.all() if tenant is None or t.tenant == tenant])
+            raise NotFound("route")
 
     return Handler
 

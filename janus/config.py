@@ -33,6 +33,10 @@ class Config:
     # Sandbox negative testing, e.g. "capture=INSTRUMENT_DECLINED". Sent as PayPal-Mock-Response.
     paypal_negative_test: str = ""
     paypal_webhook_id: str = "mock-webhook-id"   # developer.paypal.com > your app > Webhooks > Webhook ID
+    janus_secret: str = ""        # HMAC key for capability tokens and signed photo URLs (env only)
+    tenant_keys: str = ""         # "tenant:key,..." provider API keys (env only)
+    admin_token: str = ""         # read-only operator access (env only)
+    public_create: bool = True    # anyone may create thresholds in the "public" tenant (rate limited)
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -56,4 +60,8 @@ class Config:
             min_confidence=float(env("JANUS_MIN_CONFIDENCE", "0.85")),
             paypal_negative_test=env("JANUS_PAYPAL_NEGATIVE_TEST", ""),
             paypal_webhook_id=env("PAYPAL_WEBHOOK_ID", "" if paypal_mode == "sandbox" else "mock-webhook-id"),
+            janus_secret=env("JANUS_SECRET", ""),
+            tenant_keys=env("JANUS_TENANT_KEYS", ""),
+            admin_token=env("JANUS_ADMIN_TOKEN", ""),
+            public_create=env("JANUS_PUBLIC_CREATE", "1") == "1",
         )

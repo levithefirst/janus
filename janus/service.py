@@ -30,6 +30,7 @@ from .paypal import PayPalError, make_request_id, PayPalMock, PayPalSandbox, aut
 from .policy import Decision, decide, decide_items
 from .state import HOLDS_FUNDS, TERMINAL, State, TransitionError, check
 from .rules import RuleViolation
+from .security import Security, load_secret, parse_keys
 from .store import Amendment, Capture, Consent, Outcome, Pending, Store, Threshold, VerdictRecord
 
 ImageInput = Union[str, Path, bytes]
@@ -85,6 +86,8 @@ class Janus:
         setup(config.data_dir)
         self.store = Store(config.data_dir)
         self.audit = AuditLog(config.data_dir)
+        self.security = Security(load_secret(config.janus_secret, allow_ephemeral=config.paypal_mode == "mock"),
+                                 parse_keys(config.tenant_keys), config.admin_token)
         self.phash_index = ev.PhashIndex(config.data_dir)
         from .webhooks import Inbox
         self.inbox = Inbox(config.data_dir)
@@ -130,15 +133,20 @@ class Janus:
     def get(self, tid: str) -> Threshold:
         return self.store.load(tid)
 
+    def token(self, t: Threshold, role: str) -> str:
+        return self.security.token(t.tenant, t.id, role)
+
     def buyer_link(self, t: Threshold) -> str:
-        return f"{self.config.base_url}/t/{t.id}"
+        return f"{self.config.base_url}/t/{t.id}?t={self.token(t, 'buyer')}"
 
     def seller_link(self, t: Threshold) -> str:
-        return f"{self.config.base_url}/t/{t.id}?k={t.seller_key}"
+        return f"{self.config.base_url}/t/{t.id}?k={self.token(t, 'seller')}"
+
+    def role_for(self, t: Threshold, presented: Optional[str]) -> Optional[str]:
+        return self.security.role_for(t.tenant, t.id, presented)
 
     def is_seller(self, t: Threshold, key: Optional[str]) -> bool:
-        import hmac
-        return bool(key) and hmac.compare_digest(key, t.seller_key)
+        return self.role_for(t, key) == "seller"
 
     @staticmethod
     def honor_period_over(t: Threshold) -> bool:
@@ -148,7 +156,7 @@ class Janus:
     # --- 1 + 2: seller states the condition, AI compiles it ---
 
     def create(self, title: str, price: str, condition: str, description: str = "",
-               currency: str = "USD", photos: Optional[list[ImageInput]] = None) -> Threshold:
+               currency: str = "USD", photos: Optional[list[ImageInput]] = None, tenant: str = "public") -> Threshold:
         title, condition = title.strip(), condition.strip()
         if not title:
             raise JanusError("the listing needs a title")
@@ -160,7 +168,7 @@ class Janus:
         draft = Threshold.model_construct(id=tid)
         listing.photos = [self._ingest(draft, p, "listing", f"L{i}")[0] for i, p in enumerate(photos or [], 1)]
         compiled = self.ai.compile_condition(condition, listing, self.store.dir(tid), ref=tid)
-        t = Threshold(id=tid, seller_key=self.store.new_key(), state=State.CREATED, created_at=now(),
+        t = Threshold(id=tid, tenant=tenant, state=State.CREATED, created_at=now(),
                       updated_at=now(), listing=listing, condition=condition, compiled=compiled)
         self._record(t, "ai", "condition_compiled", requirements=[f"{r.id}{'*' if r.critical else ''}"
                                                                   for r in compiled.requirements])
@@ -269,11 +277,11 @@ class Janus:
                 raise JanusError("the customer must consent to the condition before paying")
             base = self.config.base_url
             order = self.paypal.create_order(t.id, t.amount, t.currency, t.listing.title,
-                                             return_url=f"{base}/paypal/return", cancel_url=f"{base}/t/{t.id}",
+                                             return_url=f"{base}/paypal/return", cancel_url=f"{base}/",
                                              request_id=make_request_id(t.id, "create"))
             t.payment.order_id, t.payment.approve_url = order["order_id"], order["approve_url"]
             self._record(t, "paypal", "order_created", order_id=order["order_id"])
-            self._move(t, State.PAYMENT_PENDING, buyer_link=self.buyer_link(t))
+            self._move(t, State.PAYMENT_PENDING)
             return t
 
     def authorize(self, tid: str) -> Threshold:

@@ -44,7 +44,8 @@ def with_exif(name, taken_at=None, offset="+00:00", gps=None, scale=1.0) -> byte
 
 def make_config(tmp_path: Path, **over) -> Config:
     base = dict(paypal_mode="mock", paypal_client_id="", paypal_client_secret="", ai_mode="mock",
-                model="claude-opus-5-5", data_dir=tmp_path / "data", base_url="http://localhost:8000")
+                model="claude-opus-5-5", data_dir=tmp_path / "data", base_url="http://localhost:8000",
+                janus_secret="test-secret-" + "x" * 32)
     base.update(over)
     return Config(**base)
 
