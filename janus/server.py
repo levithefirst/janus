@@ -7,6 +7,9 @@ GET  /t/{id}?k=SELLER_KEY     seller view of the same page (can refund while fun
 GET  /t/{id}/pay              shows the terms (records nothing, safe for link previews)
 POST /t/{id}/pay              form: terms hash; records consent for those terms, then redirects to PayPal
 GET  /paypal/return?token=..  PayPal sends the buyer back here -> authorize -> /t/{id}
+GET  /jobs[?tab=completed]    My jobs + recent activity: jobs whose link this browser opened (HttpOnly cookie)
+GET  /profile                 sign-in name (read in the browser from the landing's session) + job counts
+GET  /help                    how it works and FAQ
 
 JSON API:
 POST /api/thresholds          {title, price, condition, description?, currency?, photo_b64?}
@@ -42,7 +45,7 @@ from .paypal import PayPalError
 from .service import Janus, JanusError, OverrideRequired, StaleTermsError
 from .state import HOLDS_FUNDS, State, TransitionError
 from .security import RateLimiter
-from . import web_jobs
+from . import web_account, web_jobs
 from .store import NotFound, Threshold
 
 STATIC = Path(__file__).parent / "static"
@@ -330,12 +333,6 @@ Release payment to seller</button></div>""")
     return page(f"{t.listing.title} · Janus", "".join(parts), refresh, token=me)
 
 
-def message_page(title: str, msg: str, link: str = "/") -> str:
-    return page(title, f'<div class="banner b-info">{e(title)}<p>{e(msg)}</p><a class="btn" href="{e(link)}">Continue</a></div>')
-
-
-# ---------------------------------------------------------------- HTTP
-
 def make_handler(j: Janus, limiter: Optional[RateLimiter] = None):
     limiter = limiter or RateLimiter()
 
@@ -343,7 +340,7 @@ def make_handler(j: Janus, limiter: Optional[RateLimiter] = None):
         def log_message(self, fmt, *args):  # keep stderr for janus's own log lines
             pass
 
-        def _send(self, status: int, body, ctype="application/json"):
+        def _send(self, status: int, body, ctype="application/json", cookie: str = ""):
             if isinstance(body, bytes):
                 data = body
             else:
@@ -352,6 +349,8 @@ def make_handler(j: Janus, limiter: Optional[RateLimiter] = None):
             self.send_header("Content-Type", ctype + ("" if ctype.startswith("image/") else "; charset=utf-8"))
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Cache-Control", "no-store")
+            if cookie:
+                self.send_header("Set-Cookie", cookie)
             self.end_headers()
             self.wfile.write(data)
 
@@ -449,8 +448,12 @@ def make_handler(j: Janus, limiter: Optional[RateLimiter] = None):
         def _err(self, api: bool, status: int, msg: str):
             if api:
                 return self._send(status, {"error": msg})
-            self._send(status, self._legacy(message_page("Not found" if status == 404 else "Something went wrong", msg)),
-                       "text/html")
+            if status == 404:
+                title, msg = "Not found", ("This link is not valid, or the job does not exist. Check the link you "
+                                           "were sent, or open My jobs.")
+            else:
+                title = "That did not work"
+            self._send(status, web_jobs.message(j, title, msg), "text/html")
 
         def do_GET(self):
             self._dispatch("GET")
@@ -570,6 +573,13 @@ def make_handler(j: Janus, limiter: Optional[RateLimiter] = None):
                 raise PayPalError("PayPal did not return an approval link for this order. Try again in a moment.")
             return self._redirect(t.payment.approve_url, cookie=self._return_cookie(tid, cred))
 
+        def _wallet(self, t: Threshold, role: str) -> str:
+            """Remember this job on this browser for My jobs (its role token, never a tenant key)."""
+            value = web_account.wallet_add(self._cookie(web_account.WALLET), t.id, j.token(t, role))
+            secure = "; Secure" if j.config.base_url.startswith("https") else ""
+            return (f"{web_account.WALLET}={value}; Path={j.config.mount or '/'}; Max-Age=31536000; HttpOnly; "
+                    f"SameSite=Lax{secure}")
+
         def _return_cookie(self, tid: str, cred: str) -> str:
             secure = "; Secure" if j.config.base_url.startswith("https") else ""
             return f"janus_{tid}={cred}; Path={j.config.mount}/paypal/return; Max-Age=3600; HttpOnly; SameSite=Lax{secure}"
@@ -589,6 +599,13 @@ def make_handler(j: Janus, limiter: Optional[RateLimiter] = None):
                 return self._send(200, {"actions": tick(j)})
             if parts == ["logo.svg"]:
                 return self._send(200, (STATIC / "logo.svg").read_bytes(), "image/svg+xml")
+            if parts in (["jobs"], ["profile"]):
+                held = web_account.held_jobs(j, self._cookie(web_account.WALLET))
+                page_html = (web_account.jobs_page(j, held, "completed" if q.get("tab") == "completed" else "active")
+                             if parts == ["jobs"] else web_account.profile_page(j, held))
+                return self._send(200, page_html, "text/html")
+            if parts == ["help"]:
+                return self._send(200, web_account.help_page(j), "text/html")
             if parts == ["healthz"]:
                 return self._send(200, {"ok": True})
             cred = self._credential(q)
@@ -600,13 +617,13 @@ def make_handler(j: Janus, limiter: Optional[RateLimiter] = None):
                 try:
                     j.authorize(t.id, order_id=q.get("token"))
                 except JanusError as ex:
-                    return self._send(200, self._legacy(message_page("Not authorized yet", str(ex), "/")), "text/html")
+                    return self._send(200, web_jobs.message(j, "Not authorized yet", str(ex)), "text/html")
                 bt = self._cookie(f"janus_{t.id}")
                 if j.role_for(t, bt) == BUYER:
                     return self._redirect(f"/t/{t.id}?t={quote(bt)}")
-                return self._send(200, self._legacy(message_page(
-                    "Payment authorized", "PayPal is holding the money. Go back to the link the provider sent you "
-                    "to continue.", "/")), "text/html")
+                return self._send(200, web_jobs.message(
+                    j, "Payment authorized", "PayPal is holding the money. Go back to the link the provider sent you "
+                    "to continue."), "text/html")
             if len(parts) >= 2 and parts[0] == "t" and ID.fullmatch(parts[1]):
                 tid = parts[1]
                 if len(parts) == 5 and parts[2] == "files" and parts[3] in ("listing", "evidence"):
@@ -626,7 +643,7 @@ def make_handler(j: Janus, limiter: Optional[RateLimiter] = None):
                 if len(parts) == 2:
                     t = self._view(tid)
                     if t.kind == "job":
-                        return self._send(200, web_jobs.job_page(j, t, role), "text/html")
+                        return self._send(200, web_jobs.job_page(j, t, role), "text/html", cookie=self._wallet(t, role))
                     return self._send(200, self._legacy(threshold_page(j, t, role == SELLER)), "text/html")
                 if parts[2:] == ["pay"] and role == BUYER:
                     # A GET only shows the terms. Link previews and prefetchers issue GETs, so a GET must never

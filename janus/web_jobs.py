@@ -12,7 +12,10 @@ from typing import TYPE_CHECKING
 from urllib.parse import quote
 
 from . import rules
-from .state import DECIDABLE, State
+from .state import DECIDABLE, HOLDS_FUNDS, TERMINAL, State
+from .clock import iso, parse
+from .constants import AUTH_VALIDITY, VOID_BEFORE_EXPIRY
+from .web_account import captured, held_now, released, timeline, when
 
 if TYPE_CHECKING:
     from .service import Janus
@@ -66,6 +69,21 @@ ol.audit li{padding:8px 0;border-top:1px solid var(--line);display:grid;grid-tem
 ol.audit .h{font-family:ui-monospace,Menlo,monospace;color:var(--muted);grid-column:2;font-size:11px}
 .flag{border-left:3px solid var(--warn);padding:6px 0 6px 12px;margin:8px 0}
 #busy{display:none}.err{color:var(--bad);font-weight:600;margin-top:10px}
+.nav{display:flex;gap:6px;align-items:center;flex-wrap:wrap;justify-content:flex-end}
+.nav a{color:var(--ink);text-decoration:none;font-size:13px;padding:6px 10px;border-radius:999px}
+.nav a.on,.nav a:hover{background:var(--bg-elev);border:1px solid var(--line);padding:5px 9px}
+main p a,dd a{color:var(--ink)}.foot{margin-top:28px;font-size:13px;color:var(--muted)}.foot a{color:var(--muted)}
+.pill{display:inline-block;font-size:12px;font-weight:600;border-radius:999px;padding:2px 9px;margin:0 0 4px}
+.pill.info{border:1px solid var(--line)}
+.tabs{display:flex;gap:6px;margin:0 0 6px}.tab{color:var(--muted);text-decoration:none;font-size:14px;font-weight:600;
+padding:6px 12px;border-radius:999px}.tab.on{color:var(--ink);background:var(--bg);border:1px solid var(--line)}
+a.jobrow{display:flex;flex-direction:column;gap:2px;color:var(--ink);text-decoration:none}
+ol.steps{margin:0;padding:0 0 0 22px}ol.steps li{padding:4px 0}ol.steps li.done{color:var(--ink)}
+ol.steps li.todo{color:var(--muted)}ol.steps li.now{font-weight:600}ol.steps li.now::marker{color:var(--ok)}
+ol.steps .small{display:block;font-weight:400}
+details{border-top:1px solid var(--line);padding:12px 0}details:first-of-type{border-top:0}
+summary{cursor:pointer;font-weight:600}details p{margin:8px 0 0;color:var(--muted)}
+.who{display:flex;align-items:center;gap:12px}.who img{width:44px;height:44px;border-radius:999px;object-fit:cover}
 """
 
 THEME = """(function(){try{var t=localStorage.getItem("janus-theme");if(!t)t=matchMedia("(prefers-color-scheme: dark)")
@@ -95,11 +113,17 @@ async function upload(phase){const f=document.getElementById('f-'+phase).files[0
 function overrideReason(){const c=document.getElementById('ov');if(!c)return '';
   return c.checked?(document.getElementById('ov-why').value||'').trim():''}
 async function decide(kind){const body={override_reason:overrideReason()};
-  if(kind==='partial'){body.amount=document.getElementById('amt').value}
+  if(kind==='partial'){body.amount=document.getElementById('amt').value;const n=partNumbers();
+    if(n&&!confirm('Capture '+n[0]+' '+n[2]+' for the provider and release '+n[1]+' '+n[2]+' back to you?'))return}
   if(kind==='reject'){if(!confirm('Reject the work and release the hold? You will not be charged.'))return;
     body.reason=(document.getElementById('why')||{}).value||''}
   if(kind==='accept'&&!confirm('Pay the full amount to the provider?'))return;
   await act('/api/t/'+JID+'/'+kind,body,'Telling PayPal…','err-decide')}
+function partNumbers(){const i=document.getElementById('amt'),o=document.getElementById('part-nums');if(!i||!o)return null;
+  const held=Number(i.dataset.held),v=Math.round(Number(i.value)*100)/100,c=i.dataset.cur;
+  if(!(v>0&&v<held)){o.textContent='Enter an amount above 0 and below '+held.toFixed(2)+' '+c+'.';return null}
+  const n=[v.toFixed(2),(held-v).toFixed(2),c];o.textContent='PayPal captures '+n[0]+' '+c+' for the provider, then '+
+  'releases '+n[1]+' '+c+' back to you. Janus fee 0.00 '+c+'.';return n}
 let seen=0,state=document.body.dataset.state,leaving=false;
 // A form submit or navigation in flight must never be cancelled by the live refresh below: the first tap on the
 // approve button saves the order a moment before the redirect to PayPal reaches the browser.
@@ -154,11 +178,21 @@ def shell(j: "Janus", title: str, body: str, token: str = "", job: str = "", sta
 <link href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet">
 <script>{THEME}</script><style>{CSS}</style></head>
 <body data-base="{e(base)}" data-token="{e(token)}" data-job="{e(job)}" data-state="{e(state)}"><main>
-<div class="top"><a class="brand" href="/">{logo}<span>Janus</span></a>
-<button class="theme" onclick="toggleTheme()" aria-label="Switch light or dark">Theme</button></div>
+<div class="top"><a class="brand" href="/">{logo}<span>Janus</span></a><nav class="nav">
+<a href="{base}/jobs">My jobs</a><a href="{base}/help">Help</a><a href="{base}/profile">Profile</a>
+<button class="theme" onclick="toggleTheme()" aria-label="Switch light or dark">Theme</button></nav></div>
 {body}
 <div id="busy" class="banner info"><span class="msg">Working…</span></div>
+<p class="foot"><a href="{base}/">New job</a> · <a href="{base}/jobs">My jobs</a> · <a href="{base}/help">How it works
+and FAQ</a> · Janus never holds your money.</p>
 </main><script>{JS}</script></body></html>"""
+
+
+def message(j: "Janus", title: str, msg: str) -> str:
+    """A friendly page for errors and notices, always with a way forward."""
+    base = j.config.mount
+    return shell(j, f"{title} · Janus", f"""<h1>{e(title)}</h1><div class="card"><p>{e(msg)}</p>
+<a class="btn" href="{base}/jobs">My jobs</a><a class="btn ghost" href="{base}/">Describe a new job</a></div>""")
 
 
 def home(j: "Janus") -> str:
@@ -220,6 +254,27 @@ def _renew_card(j: "Janus", t: "Threshold", me: str, money: str, why: str, closa
 for {e(money)}. The checklist and photos stay the same. You still decide at the end.</p>
 <form method="post" action="{j.config.mount}/t/{t.id}/renew?t={quote(me)}"><input type="hidden" name="terms_hash"
 value="{e(rules.terms_hash(t))}"><button class="btn" type="submit">Approve a new hold</button></form>{close}</div>"""
+
+
+def _money_card(t: "Threshold") -> str:
+    """Authorized, captured, released or still held, the $0 fee, and when the hold ends."""
+    cur, p = t.currency, t.payment
+    rows = [("Authorized by the customer", p.authorized_amount or t.amount), ("Captured", f"{captured(t):.2f}")]
+    rows.append(("Still held by PayPal", f"{held_now(t):.2f}") if t.state not in TERMINAL
+                else ("Voided (released to the customer)", f"{released(t):.2f}"))
+    rows.append(("Janus fee", "0.00"))
+    dl = "".join(f"<dt>{e(k)}</dt><dd>{e(str(v))} {e(cur)}</dd>" for k, v in rows)
+    end = ""
+    if t.state in HOLDS_FUNDS and p.authorization_id:
+        paypal_end = parse(p.expiration_time)
+        start = parse(p.original_authorized_at or p.authorized_at)
+        cands = [x for x in (paypal_end, start + AUTH_VALIDITY if start else None) if x]
+        if cands:
+            exp = min(cands)
+            end = (f'<p class="small">Hold expires on {e(when(iso(exp)))} UTC. If no decision is made, Janus '
+                   f'releases it on {e(when(iso(exp - VOID_BEFORE_EXPIRY)))} UTC.</p>')
+    return (f'<div class="card"><h2>Money</h2><dl>{dl}</dl>{end}<p class="small muted">Janus never holds your money. '
+            f'PayPal holds it until you decide.</p></div>')
 
 
 def job_page(j: "Janus", t: "Threshold", role: str) -> str:
@@ -305,6 +360,10 @@ Overall confidence {conf}. Janus does not move money; {"your customer decides" i
 {f'<button class="btn" onclick="act(&#39;/api/t/{t.id}/verify&#39;,{{}},&#39;Checking the photos…&#39;,&#39;err-photo&#39;)">Build acceptance packet</button>' if can_build else ""}
 </div>""")
 
+    # money
+    if p.authorization_id or p.captures:
+        parts.append(_money_card(t))
+
     # customer decision
     if role == "buyer" and t.state in DECIDABLE and p.authorization_id:
         override = ""
@@ -314,8 +373,11 @@ I checked the work myself and want to pay despite the flags.</label><input id="o
 placeholder="Why? (recorded in the audit trail)"></div>"""
         parts.append(f"""<div class="card"><h2>Your decision</h2>{override}
 <button class="btn" onclick="decide('accept')">Accept · pay {e(money)}</button>
-<label for="amt">Or pay part</label><div class="row"><input id="amt" inputmode="decimal" placeholder="Amount">
+<label for="amt">Or pay part</label><div class="row"><input id="amt" inputmode="decimal" placeholder="Amount"
+data-held="{e(str(held_now(t)))}" data-cur="{e(t.currency)}" oninput="partNumbers()">
 <button class="btn ghost" style="margin-top:0" onclick="decide('partial')">Pay part, release the rest</button></div>
+<p class="small muted" id="part-nums">Enter an amount above 0 and below {e(str(held_now(t)))} {e(t.currency)}: you see
+what is captured and what is released before you confirm.</p>
 <label for="why">Or reject</label><input id="why" maxlength="500" placeholder="What is wrong? (optional)">
 <button class="btn ghost" onclick="decide('reject')">Reject · release the hold</button>
 <div id="err-decide" class="err"></div></div>""")
@@ -331,7 +393,10 @@ placeholder="Why? (recorded in the audit trail)"></div>"""
         dl = "".join(f"<dt>{e(k)}</dt><dd>{e(str(x))}</dd>" for k, x in rows if x)
         parts.append(f'<div class="card"><h2>PayPal record</h2><dl>{dl}</dl></div>')
 
-    # live audit trail
+    # status timeline, then the live audit trail
+    steps = "".join(f'<li class="{st}">{e(lbl)}<span class="small muted">{e(when(ts)) + " UTC" if ts else ""}</span></li>'
+                    for lbl, ts, st in timeline(t, j.audit.entries(t.id)))
+    parts.append(f'<div class="card"><h2>Status</h2><ol class="steps">{steps}</ol></div>')
     parts.append("""<div class="card"><h2>Audit trail</h2><p class="small muted">Every PayPal call, rule check, AI output
 and decision, each linked to the previous one by its hash. Updates live.</p><p class="small" id="chain">Loading…</p>
 <button class="btn ghost" onclick="verifyChain()">Verify chain</button><ol class="audit" id="audit"></ol></div>""")
