@@ -220,6 +220,7 @@
       max-width: min(280px, 46vw);
     }
     .session-chip.on { display: inline-flex; }
+    .session-open { display: inline-flex; align-items: center; gap: 10px; min-width: 0; padding: 0; background: none; border: 0; color: inherit; font: inherit; cursor: pointer; }
     .session-chip .who {
       font-size: 13px; font-weight: 500; color: var(--muted);
       overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -274,8 +275,10 @@
           </svg>
         </button>
         <div class="session-chip" id="sessionChip">
-          <img class="avatar" id="sessionAvatar" alt="" width="24" height="24" hidden />
-          <span class="who" id="sessionWho"></span>
+          <button class="session-open" id="sessionOpen" type="button" aria-label="Open account">
+            <img class="avatar" id="sessionAvatar" alt="" width="24" height="24" hidden />
+            <span class="who" id="sessionWho"></span>
+          </button>
           <button class="btn btn-ghost" id="headerSignOut" type="button">Sign out</button>
         </div>
         <button class="btn btn-solid" data-open-auth id="headerSignIn" type="button">Sign in</button>
@@ -290,7 +293,7 @@
         <h1>The threshold for payments.</h1>
         <p class="lede">The customer pays up front. The money is held, not taken. The provider gets paid when the customer accepts the work. If the work is not done, the hold is cancelled.</p>
         <div class="cta-row">
-          <button class="btn btn-solid" data-open-auth type="button">Get started</button>
+          <a class="btn btn-solid" href="/app">Get started</a>
           <a class="btn btn-ghost" href="#how">See how it works</a>
         </div>
       </section>
@@ -344,7 +347,7 @@
       <section class="close">
         <h2>Start your next job with the money held.</h2>
         <p>For plumbers, cleaners, repair shops and other local providers. Works with PayPal.</p>
-        <button class="btn btn-solid" data-open-auth type="button">Get started</button>
+        <a class="btn btn-solid" href="/app">Get started</a>
       </section>
     </main>
 
@@ -423,7 +426,10 @@
 
     function openAuth() { modal.classList.add("open"); }
     function closeAuth() { modal.classList.remove("open"); }
+    // The modal opens from the header "Sign in" button (signed out) and from the avatar (signed in). Every
+    // "Get started" button is a plain link to /app.
     document.querySelectorAll("[data-open-auth]").forEach((el) => el.addEventListener("click", openAuth));
+    document.getElementById("sessionOpen").addEventListener("click", openAuth);
     document.getElementById("authClose").addEventListener("click", closeAuth);
     modal.addEventListener("click", (e) => { if (e.target === modal) closeAuth(); });
     document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeAuth(); });
@@ -556,7 +562,7 @@
           form.appendChild(input);
         };
         add("csrfToken", token);
-        add("callbackUrl", window.location.origin + "/");
+        add("callbackUrl", window.location.origin + "/app");
         document.body.appendChild(form);
         form.submit();
       } catch (err) {

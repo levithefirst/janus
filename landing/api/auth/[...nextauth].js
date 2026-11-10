@@ -36,5 +36,16 @@ export default async function handler(req) {
       signIn: "/",
       error: "/",
     },
+    callbacks: {
+      // After sign-in the user goes to the app. The page passes callbackUrl=/app; anything that is not on
+      // this site (an open redirect) falls back to /app too. Sign-out passes "/" and lands on the landing page.
+      async redirect({ url, baseUrl }) {
+        if (url.startsWith("/")) return baseUrl + url;
+        try {
+          if (new URL(url).origin === baseUrl) return url;
+        } catch (_) {}
+        return baseUrl + "/app";
+      },
+    },
   });
 }
