@@ -148,6 +148,17 @@ AI mistakes) · [CONFIDENCE](docs/CONFIDENCE.md)
 3. Customer: tap **Reject**. The hold is voided; nothing is charged. The audit trail shows the packet, the
    rejection and the PayPal void.
 
+## My jobs, status, money and help
+
+- **My jobs** (`/app/jobs`): every job opened on this browser, as customer or provider, with Active and Completed
+  tabs, a status badge, amounts held and captured, and recent activity read from the audit trails. Janus has no
+  accounts: a job is reached by its secret link, so the list is the jobs whose link this browser opened, each
+  re-checked against its token.
+- **Job page**: a status timeline (Created, Authorized, Evidence submitted, AI packet ready, Decision, outcome) above
+  the audit trail; a money card (authorized, captured, still held or voided, Janus fee 0.00, hold expiry and the date
+  Janus releases it); Pay part shows the exact amounts captured and released before the customer confirms.
+- **Profile** (`/app/profile`) and **How it works and FAQ** (`/app/help`), linked from the nav and footer.
+
 ## The acceptance packet
 
 For each checklist item: **pass / fail / unclear**, a **confidence** (0 to 1) and a **one-line reason** from the

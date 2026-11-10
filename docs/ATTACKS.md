@@ -12,11 +12,11 @@ Open (not addressed yet), Accepted (a deliberate trade-off, explained).
 
 | Status | Count |
 |---|---|
-| Mitigated | 45 |
+| Mitigated | 46 |
 | Partial | 13 |
 | Open | 1 |
 | Accepted | 3 |
-| **Total** | **62** |
+| **Total** | **63** |
 
 ## Money movement
 
@@ -109,3 +109,4 @@ Open (not addressed yet), Accepted (a deliberate trade-off, explained).
 | J8 | The customer's partial amount is zero, negative, or the whole hold | Medium | Mitigated | The amount must be positive and below what is still held; paying all of it is an accept | `test_jobs.py::test_partial_amount_must_be_positive_and_below_the_hold` |
 | J9 | The provider accepts or pays part on the customer's behalf | High | Mitigated | Accept, partial and reject are customer-only routes; the provider's token gets 404 | `test_job_http.py::test_good_job_partial_capture_then_void` |
 | J10 | A hold is renewed and both the old and the new authorization get captured | Critical | Mitigated | One live hold per job: the old authorization is voided once the new one exists; a late capture on the old hold means the new order is never authorized, or the new hold is voided at once; rule 9 refuses a capture on a replaced authorization or above the price in total; renewed holds use their own PayPal-Request-Ids | `test_renewal.py::test_late_capture_on_old_hold_before_return_means_no_new_hold`, `test_late_capture_on_old_hold_after_new_auth_voids_the_new_hold`, `test_capture_in_flight_on_old_hold_blocks_the_renewal_then_wins`, `test_rules_block_a_capture_written_for_the_replaced_authorization`, `test_rules_block_capturing_more_than_the_price_across_authorizations`, `test_scheduler_void_lapses_then_new_hold_has_its_own_request_ids` |
+| J11 | My jobs shows another person's jobs, or a forged cookie lists a job | High | Mitigated | Janus has no accounts: the list holds only jobs whose role token this browser received by opening the link, kept in an HttpOnly cookie; every entry is re-verified against the job on each request, and tenant keys are never stored | `test_account.py::test_my_jobs_lists_only_jobs_opened_on_this_browser`, `test_forged_or_foreign_tokens_in_the_cookie_show_nothing` |
