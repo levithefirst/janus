@@ -1,0 +1,8 @@
+{
+  "name": "janus-site",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@auth/core": "^0.37.4"
+  }
+}

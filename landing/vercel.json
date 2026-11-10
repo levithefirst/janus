@@ -1,0 +1,22 @@
+{
+  "framework": null,
+  "outputDirectory": "public",
+  "rewrites": [
+    {
+      "source": "/api/auth/:path*",
+      "destination": "/api/auth/[...nextauth]"
+    },
+    {
+      "source": "/app",
+      "destination": "https://janus-app-fawn.vercel.app/app"
+    },
+    {
+      "source": "/app/:path*",
+      "destination": "https://janus-app-fawn.vercel.app/app/:path*"
+    },
+    {
+      "source": "/paypal/:path*",
+      "destination": "https://janus-app-fawn.vercel.app/paypal/:path*"
+    }
+  ]
+}
